@@ -118,6 +118,8 @@ class EnclaveTUI:
         self._project_root: Path = Path.cwd()
         self._project_tree: str = ""
         self._compact_mode: bool = False
+        self._enable_thinking: bool = False
+        self._require_permission: bool = False
 
     # ── Persistence ──────────────────────────────────────────────────────── #
 
@@ -351,6 +353,18 @@ class EnclaveTUI:
                         self._compact_mode = not self._compact_mode
                         status_str = "enabled" if self._compact_mode else "disabled"
                         self.console.print(f"  [cyan]Compact mode {status_str}.[/cyan]")
+                    elif command == "think":
+                        self._enable_thinking = not self._enable_thinking
+                        self.service.controller.enable_thinking = self._enable_thinking
+                        status_str = "enabled" if self._enable_thinking else "disabled"
+                        self.console.print(f"  [cyan]Extended thinking {status_str}.[/cyan]")
+                        if self._enable_thinking:
+                            self.console.print("  [dim]The model will reason through problems before acting (uses more tokens).[/dim]")
+                    elif command == "permissions":
+                        self._require_permission = not self._require_permission
+                        self.service.controller.require_permission = self._require_permission
+                        status_str = "enabled" if self._require_permission else "disabled"
+                        self.console.print(f"  [cyan]Permission prompts {status_str}.[/cyan]")
                     elif command == "model":
                         await self._show_model_selector()
                         # Regenerate system prompt with potentially new model/provider
@@ -441,6 +455,7 @@ class EnclaveTUI:
         )
 
         in_response_block = False
+        in_thinking_block = False
         current_step = 0
 
         while not turn_task.done() or not event_queue.empty():
@@ -458,14 +473,32 @@ class EnclaveTUI:
                     if in_response_block:
                         self.console.print()
                         in_response_block = False
+                    if in_thinking_block:
+                        self.console.print("[/dim]")
+                        in_thinking_block = False
                     current_step = step_number
                     if not self._compact_mode:
                         self.console.print(f"\n[bold cyan]Step {step_number}: Thinking...[/bold cyan]")
 
+                elif event_type == "thinking_content":
+                    # Extended thinking — show in dimmed text
+                    token = data.get("chunk", "")
+                    if in_response_block:
+                        self.console.print()
+                        in_response_block = False
+                    if not in_thinking_block:
+                        self.console.print("  [dim italic]💭 ", end="")
+                        in_thinking_block = True
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+
                 elif event_type == "chunk":
                     token = data.get("chunk", "")
+                    if in_thinking_block:
+                        self.console.print("[/dim italic]")
+                        in_thinking_block = False
                     if not in_response_block:
-                        self.console.print("[green]Response: [/green]", end="")
+                        self.console.print()
                         in_response_block = True
                     sys.stdout.write(token)
                     sys.stdout.flush()
@@ -474,10 +507,15 @@ class EnclaveTUI:
                     if in_response_block:
                         self.console.print()
                         in_response_block = False
+                    if in_thinking_block:
+                        self.console.print("[/dim italic]")
+                        in_thinking_block = False
                     tool_name = data.get("tool", "")
-                    args_keys = ", ".join(data.get("args_keys", []))
+                    args_preview = data.get("args", {})
+                    # Show the most relevant arg for the tool
+                    detail = _format_tool_detail(tool_name, args_preview)
                     if not self._compact_mode:
-                        self.console.print(f"  [bold yellow]⚡ {tool_name}({args_keys})[/bold yellow]")
+                        self.console.print(f"  [bold yellow]⚡ {tool_name}[/bold yellow] [dim]{detail}[/dim]")
                     else:
                         self.console.print(f" ⚡ [yellow]{tool_name}[/yellow] ", end="", flush=True)
 
@@ -494,10 +532,18 @@ class EnclaveTUI:
                     else:
                         self.console.print(f"{status_str} ", end="", flush=True)
 
+                elif event_type == "checkpoint":
+                    tool_calls = data.get("tool_calls", 0)
+                    cost = data.get("cost_usd", 0.0)
+                    self.console.print(f"\n  [dim cyan]── checkpoint: {tool_calls} tool calls · ${cost:.6f} ──[/dim cyan]")
+
                 elif event_type == "error":
                     if in_response_block:
                         self.console.print()
                         in_response_block = False
+                    if in_thinking_block:
+                        self.console.print("[/dim italic]")
+                        in_thinking_block = False
                     err = data.get("error", "Unknown error")
                     self.console.print(f"\n[bold red]❌ Error: {err}[/bold red]")
 
@@ -541,6 +587,8 @@ class EnclaveTUI:
   [bold white]/status[/bold white]               Show session stats (messages, cost, tokens)
   [bold white]/cost[/bold white]                 Show detailed cost breakdown
   [bold white]/compact[/bold white]              Toggle compact output mode
+  [bold white]/think[/bold white]                Toggle extended thinking (deeper reasoning)
+  [bold white]/permissions[/bold white]          Toggle permission prompts for dangerous ops
   [bold white]/attest[/bold white]               Fetch and display attestation document
   [bold white]/task <description>[/bold white]  Run a single-shot task via vsock
   [bold white]/exit[/bold white] or [bold white]/quit[/bold white]        Exit the assistant
@@ -555,15 +603,33 @@ class EnclaveTUI:
             self.config.llm_provider, self.config.llm_model
         )
 
+        # Get git branch
+        git_branch = "(not a git repo)"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(self._project_root),
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                git_branch = result.stdout.strip()
+        except Exception:
+            pass
+
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column(style="bold cyan", width=18)
         table.add_column()
         table.add_row("Session Uptime", _format_duration(uptime))
         table.add_row("Project Root", str(self._project_root))
+        table.add_row("Git Branch", git_branch)
         table.add_row("LLM Provider", provider_label)
         table.add_row("Messages", str(len(self._conversation_history)))
         table.add_row("Session Cost", f"${self._session_cost:.6f}")
         table.add_row("Compact Mode", "Enabled" if self._compact_mode else "Disabled")
+        table.add_row("Extended Thinking", "[green]Enabled[/green]" if self._enable_thinking else "Disabled")
+        table.add_row("Permission Prompts", "[green]Enabled[/green]" if self._require_permission else "Disabled")
+        table.add_row("Tools", ", ".join(self.service.tool_registry.names))
 
         self.console.print(
             Panel(table, title="[bold cyan]Session Status[/bold cyan]", border_style="cyan", padding=(1, 2))
@@ -1234,6 +1300,37 @@ def _format_provider_label(provider: str, model: str) -> str:
     if provider == "mock":
         return "[bold yellow]Mock LLM[/bold yellow] [dim](use 'model' command to switch)[/dim]"
     return f"[bold green]{display}[/bold green] ({model})"
+
+
+def _format_tool_detail(tool_name: str, args: dict[str, str]) -> str:
+    """Format a concise detail string for a tool call based on the tool type."""
+    if tool_name == "bash":
+        cmd = args.get("command", "")
+        return f"$ {cmd}" if cmd else ""
+    elif tool_name == "read_file":
+        return args.get("path", "")
+    elif tool_name == "write_file":
+        return args.get("path", "")
+    elif tool_name in ("edit_file", "multi_edit"):
+        return args.get("path", "")
+    elif tool_name == "grep_search":
+        pattern = args.get("pattern", "")
+        include = args.get("include", "")
+        return f"/{pattern}/" + (f" ({include})" if include else "")
+    elif tool_name == "list_dir":
+        return args.get("path", ".")
+    elif tool_name == "git":
+        sub = args.get("subcommand", "")
+        msg = args.get("message", "")
+        return f"{sub}" + (f': "{msg[:50]}"' if msg else "")
+    else:
+        # Generic: show first key=value
+        for k, v in args.items():
+            val = str(v)
+            if len(val) > 60:
+                val = val[:60] + "..."
+            return f"{k}={val}"
+    return ""
 
 
 # ─── Entry Point ────────────────────────────────────────────────────────────── #

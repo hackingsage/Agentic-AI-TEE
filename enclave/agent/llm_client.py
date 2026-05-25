@@ -20,6 +20,7 @@ from enclave.agent.models import (
     LLMResponse,
     Message,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     ToolResultBlock,
     ContentBlock,
@@ -271,6 +272,10 @@ def _block_to_dict(block: ContentBlock) -> dict[str, Any]:
     """Convert ContentBlock to Anthropic Messages API block structure."""
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text}
+    elif isinstance(block, ThinkingBlock):
+        # ThinkingBlocks are typically filtered before sending to the API,
+        # but if they make it here, serialize them properly
+        return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
     elif isinstance(block, ToolUseBlock):
         return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
     elif isinstance(block, ToolResultBlock):
@@ -411,6 +416,8 @@ class LLMClient(ABC):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         """Call the LLM with a system prompt and message history.
 
@@ -421,6 +428,9 @@ class LLMClient(ABC):
             max_tokens: Maximum output tokens.
             task_id: For structured logging only.
             step_number: For structured logging only.
+            on_chunk: Callback for streaming text tokens.
+            enable_thinking: Enable extended thinking (Anthropic only).
+            on_thinking_chunk: Callback for streaming thinking tokens.
 
         Returns:
             LLMResponse with structured content blocks, token counts, and latency.
@@ -470,6 +480,8 @@ class AnthropicClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         client = self._get_client()
 
@@ -480,9 +492,12 @@ class AnthropicClient(LLMClient):
             if isinstance(m.content, str):
                 api_messages.append({"role": m.role, "content": m.content})
             else:
+                # Filter out ThinkingBlocks — they must not be sent back to the API
+                # as regular content (Anthropic uses a separate mechanism)
+                filtered = [_block_to_dict(b) for b in m.content if not isinstance(b, ThinkingBlock)]
                 api_messages.append({
                     "role": m.role,
-                    "content": [_block_to_dict(b) for b in m.content]
+                    "content": filtered
                 })
 
         kwargs: dict[str, Any] = {
@@ -494,11 +509,29 @@ class AnthropicClient(LLMClient):
         if tools:
             kwargs["tools"] = tools
 
-        if on_chunk is not None:
+        # Extended thinking support — requires higher max_tokens budget
+        if enable_thinking:
+            # Thinking uses output tokens, so we need a larger budget.
+            # Anthropic requires max_tokens >= 1024 when thinking is enabled.
+            thinking_budget = max(max_tokens, 16384)
+            kwargs["max_tokens"] = thinking_budget
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget - 4096,  # Reserve 4096 for actual output
+            }
+
+        if on_chunk is not None or on_thinking_chunk is not None:
             async with client.messages.stream(**kwargs) as stream:
                 async for event in stream:
-                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                        await on_chunk(event.delta.text)
+                    if hasattr(event, 'type'):
+                        if event.type == "content_block_delta":
+                            if hasattr(event.delta, 'type'):
+                                if event.delta.type == "text_delta":
+                                    if on_chunk:
+                                        await on_chunk(event.delta.text)
+                                elif event.delta.type == "thinking_delta":
+                                    if on_thinking_chunk:
+                                        await on_thinking_chunk(event.delta.thinking)
             response = await stream.get_final_message()
         else:
             response = await client.messages.create(**kwargs)
@@ -509,6 +542,11 @@ class AnthropicClient(LLMClient):
         for block in response.content:
             if block.type == "text":
                 content_blocks.append(TextBlock(text=block.text))
+            elif block.type == "thinking":
+                content_blocks.append(ThinkingBlock(
+                    thinking=block.thinking,
+                    signature=getattr(block, 'signature', ''),
+                ))
             elif block.type == "tool_use":
                 content_blocks.append(ToolUseBlock(
                     id=block.id,
@@ -533,6 +571,7 @@ class AnthropicClient(LLMClient):
                 "provider": "anthropic",
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
+                "has_thinking": bool(result.thinking_text),
                 "latency_ms": round(elapsed_ms, 2),
             },
         )
@@ -583,6 +622,8 @@ class OpenAIClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         client = self._get_client()
 
@@ -684,6 +725,8 @@ class OpenRouterClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         import httpx
         import asyncio
@@ -848,6 +891,8 @@ class GroqClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         import httpx
         import asyncio
@@ -869,6 +914,7 @@ class GroqClient(LLMClient):
         }
         if tools:
             payload["tools"] = _convert_tools_to_openai(tools)
+            payload["parallel_tool_calls"] = False
 
         max_retries = 6
         backoff = 2.0
@@ -917,6 +963,8 @@ class GroqClient(LLMClient):
                     data = resp.json()
                     break
             except httpx.HTTPError as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
+                    raise
                 if attempt == max_retries:
                     raise
                 logger.warning(
@@ -1012,6 +1060,8 @@ class GeminiClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         try:
             from google import genai
@@ -1161,6 +1211,8 @@ class OllamaClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         import httpx
 
@@ -1276,6 +1328,8 @@ class MockLLMClient(LLMClient):
         task_id: str = "",
         step_number: int = 0,
         on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        enable_thinking: bool = False,
+        on_thinking_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         self._calls.append({
             "system": system,

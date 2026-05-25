@@ -176,8 +176,10 @@ class EnclaveService:
         from enclave.tools.read_file import ReadFileTool
         from enclave.tools.write_file import WriteFileTool
         from enclave.tools.edit_file import EditFileTool
+        from enclave.tools.multi_edit_tool import MultiEditTool
         from enclave.tools.list_dir import ListDirTool
         from enclave.tools.grep_search import GrepSearchTool
+        from enclave.tools.git_tool import GitTool
         from enclave.tools.router import ToolRouter
 
         self.tool_registry = ToolRegistry()
@@ -187,8 +189,10 @@ class EnclaveService:
         self.tool_registry.register(ReadFileTool(project_root=project_root))
         self.tool_registry.register(WriteFileTool(project_root=project_root))
         self.tool_registry.register(EditFileTool(project_root=project_root))
+        self.tool_registry.register(MultiEditTool(project_root=project_root))
         self.tool_registry.register(ListDirTool(project_root=project_root))
         self.tool_registry.register(GrepSearchTool(project_root=project_root))
+        self.tool_registry.register(GitTool(cwd=project_root))
 
         # Re-bind new registry in controller
         self.controller._tool_registry = self.tool_registry

@@ -25,6 +25,20 @@ class TextBlock:
 
 
 @dataclass
+class ThinkingBlock:
+    """An extended thinking content block from the model's response.
+
+    Represents the model's internal reasoning process (Claude's extended thinking).
+    This is displayed to the user but not fed back into conversation history
+    as regular content.
+    """
+
+    thinking: str = ""
+    signature: str = ""  # Anthropic's thinking signature for verification
+    type: str = "thinking"
+
+
+@dataclass
 class ToolUseBlock:
     """A tool_use content block from the model's response.
 
@@ -53,7 +67,7 @@ class ToolResultBlock:
 
 
 # Union type for all content block variants
-ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock]
+ContentBlock = Union[TextBlock, ThinkingBlock, ToolUseBlock, ToolResultBlock]
 
 
 # ─── Messages ───────────────────────────────────────────────────────────────── #
@@ -113,8 +127,8 @@ class LLMResponse:
     """Response from the LLM provider with structured content blocks.
 
     Instead of a flat text string, the response contains a list of
-    ContentBlock objects (TextBlock and/or ToolUseBlock), matching
-    the native API response format.
+    ContentBlock objects (TextBlock, ThinkingBlock, and/or ToolUseBlock),
+    matching the native API response format.
     """
 
     content: list[ContentBlock] = field(default_factory=list)
@@ -127,6 +141,16 @@ class LLMResponse:
     def text(self) -> str:
         """Extract concatenated text from all TextBlocks."""
         parts = [b.text for b in self.content if isinstance(b, TextBlock) and b.text]
+        return "\n".join(parts)
+
+    @property
+    def thinking_text(self) -> str:
+        """Extract concatenated thinking from all ThinkingBlocks."""
+        parts = [
+            b.thinking
+            for b in self.content
+            if isinstance(b, ThinkingBlock) and b.thinking
+        ]
         return "\n".join(parts)
 
     @property
@@ -196,10 +220,21 @@ class TaskResult:
 
 @dataclass
 class StepEvent:
-    """Real-time event emitted during task execution (for SSE streaming)."""
+    """Real-time event emitted during task execution (for SSE streaming).
+
+    Event types:
+    - "thinking"         — LLM is processing (spinner)
+    - "thinking_content" — Extended thinking text from the model
+    - "chunk"            — Streaming text token from the model
+    - "tool_call"        — Tool invocation started
+    - "tool_result"      — Tool execution completed
+    - "checkpoint"       — Progress checkpoint after N tool calls
+    - "complete"         — Turn/task completed successfully
+    - "error"            — Error occurred
+    """
 
     task_id: str
     step_number: int
-    event_type: str  # "thinking", "tool_call", "tool_result", "complete", "error"
+    event_type: str
     data: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)

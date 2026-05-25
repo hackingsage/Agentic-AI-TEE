@@ -2,6 +2,13 @@
 
 Runs the step loop: LLM call → parse tool calls → dispatch → feed results back.
 Enforces max-step, cost, and timeout guards.
+
+Claude Code-style features:
+- Parallel tool execution (asyncio.gather)
+- Auto-retry failed tools (up to 2 attempts)
+- Smart output truncation (30KB limit)
+- Extended thinking support
+- Thinking content streaming
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from enclave.agent.models import (
     StepResult,
     TaskRequest,
     TaskResult,
+    ThinkingBlock,
     ToolCall,
     ToolResultBlock,
 )
@@ -34,6 +42,27 @@ DEFAULT_MAX_COST_USD = 5.0
 DEFAULT_TIMEOUT_SECONDS = 300.0
 MAX_RETRIES_PER_STEP = 3
 
+# Tool output truncation
+MAX_TOOL_OUTPUT_CHARS = 30_000  # 30KB
+TRUNCATION_KEEP_HEAD = 10_000
+TRUNCATION_KEEP_TAIL = 10_000
+
+# Tool retry
+MAX_TOOL_RETRIES = 2
+TOOL_RETRY_DELAY = 0.5  # seconds
+
+
+def _truncate_output(output: str) -> str:
+    """Truncate tool output if it exceeds the limit, keeping head and tail."""
+    if len(output) <= MAX_TOOL_OUTPUT_CHARS:
+        return output
+    truncated_chars = len(output) - TRUNCATION_KEEP_HEAD - TRUNCATION_KEEP_TAIL
+    return (
+        output[:TRUNCATION_KEEP_HEAD]
+        + f"\n\n[...truncated {truncated_chars:,} characters...]\n\n"
+        + output[-TRUNCATION_KEEP_TAIL:]
+    )
+
 
 class AgentController:
     """Manages the full lifecycle of an agent task.
@@ -41,11 +70,17 @@ class AgentController:
     Runs the core step loop:
     1. Call LLM via Planner to get next action
     2. Parse tool calls from response
-    3. Dispatch tool calls via ToolRouter
+    3. Dispatch tool calls via ToolRouter (in parallel)
     4. Feed results back to LLM
     5. Repeat until task_complete or guard triggers
 
     Emits StepEvents for real-time streaming.
+
+    Claude Code-style features:
+    - Parallel tool execution
+    - Extended thinking support
+    - Auto-retry on tool failures
+    - Smart output truncation
     """
 
     def __init__(
@@ -63,6 +98,27 @@ class AgentController:
         # Event subscribers for streaming
         self._event_queue: asyncio.Queue[StepEvent] | None = None
 
+        # Claude Code-style features
+        self._enable_thinking: bool = False
+        self._require_permission: bool = False
+        self._permission_callback: Any = None  # async callable (tool_name, args) -> bool
+
+    @property
+    def enable_thinking(self) -> bool:
+        return self._enable_thinking
+
+    @enable_thinking.setter
+    def enable_thinking(self, value: bool) -> None:
+        self._enable_thinking = value
+
+    @property
+    def require_permission(self) -> bool:
+        return self._require_permission
+
+    @require_permission.setter
+    def require_permission(self, value: bool) -> None:
+        self._require_permission = value
+
     def enable_streaming(self) -> asyncio.Queue[StepEvent]:
         """Enable event streaming. Returns the queue to read events from."""
         self._event_queue = asyncio.Queue()
@@ -72,6 +128,42 @@ class AgentController:
         """Emit a step event to the streaming queue."""
         if self._event_queue is not None:
             await self._event_queue.put(event)
+
+    async def _dispatch_with_retry(
+        self,
+        tool_call: ToolCall,
+        *,
+        task_id: str = "",
+        step_number: int = 0,
+    ) -> Any:
+        """Dispatch a tool call with automatic retry on failure."""
+        from enclave.agent.models import ToolOutput
+
+        last_output = None
+        for attempt in range(MAX_TOOL_RETRIES + 1):
+            output = await self._router.dispatch(
+                tool_call,
+                task_id=task_id,
+                step_number=step_number,
+            )
+            if output.success:
+                return output
+
+            last_output = output
+
+            if attempt < MAX_TOOL_RETRIES:
+                logger.info(
+                    "tool_retry",
+                    extra={
+                        "tool": tool_call.name,
+                        "attempt": attempt + 1,
+                        "max_retries": MAX_TOOL_RETRIES,
+                        "error": output.error,
+                    },
+                )
+                await asyncio.sleep(TOOL_RETRY_DELAY * (attempt + 1))
+
+        return last_output
 
     async def run_task(self, task: TaskRequest) -> TaskResult:
         """Execute a task through the full agent loop.
@@ -232,12 +324,22 @@ class AgentController:
                     data={"chunk": token},
                 ))
 
+            async def on_thinking_chunk(token: str) -> None:
+                await self._emit_event(StepEvent(
+                    task_id=task.task_id,
+                    step_number=step_num,
+                    event_type="thinking_content",
+                    data={"chunk": token},
+                ))
+
             llm_response = await self._planner.plan_next_step(
                 system_prompt=system_prompt,
                 messages=messages,
                 task_id=task.task_id,
                 step_number=step_num,
                 on_chunk=on_chunk,
+                enable_thinking=self._enable_thinking,
+                on_thinking_chunk=on_thinking_chunk,
             )
 
             # --- Step 2: Check if task is complete (no tool_use blocks = done) ---
@@ -285,31 +387,48 @@ class AgentController:
                     attestation_hash=attestation_hash,
                 )
 
-            # --- Step 3: Execute tool calls ---
-            # Append assistant message with all blocks (text + tool uses)
+            # --- Step 3: Execute tool calls (in parallel) ---
+            # Append assistant message with all blocks (text + thinking + tool uses)
             messages.append(Message(role="assistant", content=llm_response.content))
 
-            tool_results: list[ToolResultBlock] = []
-            for i, tool_block in enumerate(llm_response.tool_use_blocks):
+            tool_blocks = llm_response.tool_use_blocks
+
+            # Emit tool call events for all tools
+            for tool_block in tool_blocks:
                 await self._emit_event(StepEvent(
                     task_id=task.task_id,
                     step_number=step_num,
                     event_type="tool_call",
-                    data={"tool": tool_block.name, "args_keys": list(tool_block.input.keys())},
+                    data={
+                        "tool": tool_block.name,
+                        "args_keys": list(tool_block.input.keys()),
+                        "args": _safe_args_preview(tool_block.name, tool_block.input),
+                    },
                 ))
 
+            # Execute all tool calls in parallel using asyncio.gather
+            async def _execute_one(tool_block: Any) -> tuple[Any, Any]:
                 tool_call = ToolCall(name=tool_block.name, args=tool_block.input)
-                tool_output = await self._router.dispatch(
+                output = await self._dispatch_with_retry(
                     tool_call,
                     task_id=task.task_id,
                     step_number=step_num,
                 )
+                return tool_block, output
 
-                # Collect result block
+            results = await asyncio.gather(
+                *[_execute_one(tb) for tb in tool_blocks]
+            )
+
+            tool_results: list[ToolResultBlock] = []
+            for i, (tool_block, tool_output) in enumerate(results):
+                # Truncate large outputs
+                result_content = str(tool_output.result) if tool_output.success else f"Error: {tool_output.error}"
+                result_content = _truncate_output(result_content)
+
                 tool_results.append(ToolResultBlock(
                     tool_use_id=tool_block.id,
-                    content=str(tool_output.result) if tool_output.success 
-                            else f"Error: {tool_output.error}",
+                    content=result_content,
                     is_error=not tool_output.success,
                 ))
 
@@ -387,8 +506,11 @@ class AgentController:
         conversation_history.append(Message(role="user", content=user_message))
 
         steps: list[StepResult] = []
+        tool_call_count = 0
 
         async def _inner_loop():
+            nonlocal tool_call_count
+
             for step_num in range(1, max_steps + 1):
                 # --- Guard: cost ---
                 current_cost = sum(s.cost_usd for s in steps)
@@ -426,12 +548,22 @@ class AgentController:
                         data={"chunk": token},
                     ))
 
+                async def on_thinking_chunk(token: str) -> None:
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="thinking_content",
+                        data={"chunk": token},
+                    ))
+
                 llm_response = await self._planner.plan_next_step(
                     system_prompt=system_prompt,
                     messages=conversation_history,
                     task_id=task_id,
                     step_number=step_num,
                     on_chunk=on_chunk,
+                    enable_thinking=self._enable_thinking,
+                    on_thinking_chunk=on_thinking_chunk,
                 )
 
                 # --- Step 2: Check if task is complete (no tool_use blocks = done) ---
@@ -459,31 +591,53 @@ class AgentController:
 
                     return llm_response.text, total_cost
 
-                # --- Step 3: Execute tool calls ---
+                # --- Step 3: Execute tool calls (in parallel) ---
                 # Append assistant message with tool calls to history
                 conversation_history.append(Message(role="assistant", content=llm_response.content))
 
-                tool_results: list[ToolResultBlock] = []
-                for i, tool_block in enumerate(llm_response.tool_use_blocks):
+                tool_blocks = llm_response.tool_use_blocks
+
+                # Emit tool call events
+                for tool_block in tool_blocks:
                     await self._emit_event(StepEvent(
                         task_id=task_id,
                         step_number=step_num,
                         event_type="tool_call",
-                        data={"tool": tool_block.name, "args_keys": list(tool_block.input.keys())},
+                        data={
+                            "tool": tool_block.name,
+                            "args_keys": list(tool_block.input.keys()),
+                            "args": _safe_args_preview(tool_block.name, tool_block.input),
+                        },
                     ))
 
+                # Execute all tool calls in parallel
+                async def _execute_one(tool_block: Any) -> tuple[Any, Any]:
                     tool_call = ToolCall(name=tool_block.name, args=tool_block.input)
-                    tool_output = await self._router.dispatch(
+                    output = await self._dispatch_with_retry(
                         tool_call,
                         task_id=task_id,
                         step_number=step_num,
                     )
+                    return tool_block, output
 
-                    # Collect result block
+                results = await asyncio.gather(
+                    *[_execute_one(tb) for tb in tool_blocks]
+                )
+
+                tool_results: list[ToolResultBlock] = []
+                for i, (tool_block, tool_output) in enumerate(results):
+                    tool_call_count += 1
+
+                    # Truncate large outputs
+                    result_content = (
+                        str(tool_output.result) if tool_output.success
+                        else f"Error: {tool_output.error}"
+                    )
+                    result_content = _truncate_output(result_content)
+
                     tool_results.append(ToolResultBlock(
                         tool_use_id=tool_block.id,
-                        content=str(tool_output.result) if tool_output.success
-                                else f"Error: {tool_output.error}",
+                        content=result_content,
                         is_error=not tool_output.success,
                     ))
 
@@ -509,6 +663,18 @@ class AgentController:
                             "tool": tool_block.name,
                             "success": tool_output.success,
                             "latency_ms": round(tool_output.latency_ms, 2),
+                        },
+                    ))
+
+                # Emit checkpoint every 5 tool calls
+                if tool_call_count > 0 and tool_call_count % 5 == 0:
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="checkpoint",
+                        data={
+                            "tool_calls": tool_call_count,
+                            "cost_usd": sum(s.cost_usd for s in steps),
                         },
                     ))
 
@@ -558,3 +724,25 @@ class AgentController:
             total_cost = sum(s.cost_usd for s in steps)
             return f"Error: {err_msg}", conversation_history, total_cost
 
+
+def _safe_args_preview(tool_name: str, args: dict[str, Any]) -> dict[str, str]:
+    """Create a safe, truncated preview of tool arguments for display.
+
+    Shows the most relevant argument for each tool type.
+    """
+    preview: dict[str, str] = {}
+    for key, value in args.items():
+        val_str = str(value)
+        if key in ("content", "new_str", "old_str", "code"):
+            # Large content fields — show first 100 chars
+            if len(val_str) > 100:
+                preview[key] = val_str[:100] + "..."
+            else:
+                preview[key] = val_str
+        elif key in ("command",):
+            # Show commands fully (they're usually short)
+            preview[key] = val_str[:200] if len(val_str) > 200 else val_str
+        else:
+            # Other args — show up to 150 chars
+            preview[key] = val_str[:150] if len(val_str) > 150 else val_str
+    return preview
