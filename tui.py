@@ -42,6 +42,7 @@ from enclave.agent.llm_client import (
     PROVIDER_ENV_KEYS,
     get_available_providers,
 )
+from enclave.agent.models import Message
 from enclave.main import EnclaveConfig, EnclaveService
 from enclave.memory.state_db import TaskStateDB
 from enclave.vsock.client import VsockClient
@@ -110,6 +111,13 @@ class EnclaveTUI:
         self.boot_time: float = 0.0
         self._task_counter: int = 0
         self._task_history: list[dict[str, Any]] = []
+
+        # Conversational Coding Assistant mode states
+        self._conversation_history: list[Message] = []
+        self._session_cost: float = 0.0
+        self._project_root: Path = Path.cwd()
+        self._project_tree: str = ""
+        self._compact_mode: bool = False
 
     # ── Persistence ──────────────────────────────────────────────────────── #
 
@@ -198,10 +206,25 @@ class EnclaveTUI:
             elif not os.getenv("ENCLAVE_LLM_PROVIDER"):
                 self.config.llm_provider = "mock"
 
+            # Detect project root
+            self._project_root = self._find_project_root()
+            self.config.workspace_root = self._project_root
+
             status.update("[bold cyan]  Generating enclave crypto keys...[/bold cyan]")
             self.service = EnclaveService(self.config)
             self.service.state_db = TaskStateDB()  # in-memory for TUI
             await self.service.state_db.initialize()
+
+            # Register coding tools
+            status.update("[bold cyan]  Registering coding tools...[/bold cyan]")
+            self.service._register_coding_tools()
+
+            # Generate project tree
+            status.update("[bold cyan]  Scanning project directory...[/bold cyan]")
+            self._project_tree = self._generate_project_tree()
+            self._system_prompt = self.service.controller._planner.build_coding_system_prompt(
+                self._project_root, self._project_tree
+            )
 
             # ── Find free port ──
             status.update("[bold cyan]  Binding vsock transport...[/bold cyan]")
@@ -235,15 +258,16 @@ class EnclaveTUI:
         info_table = Table(show_header=False, box=None, padding=(0, 2))
         info_table.add_column(style="bold cyan", width=18)
         info_table.add_column()
-        info_table.add_row("Transport", f"TCP :{self.port}")
+        info_table.add_row("Mode", "Conversational Coding Assistant")
+        info_table.add_row("Project Root", str(self._project_root))
         info_table.add_row("LLM Provider", provider_label)
-        info_table.add_row("Tools", ", ".join(self.service.tool_registry.names))
-        info_table.add_row("Workspace", str(self.config.workspace_root))
+        info_table.add_row("Coding Tools", ", ".join(self.service.tool_registry.names))
+        info_table.add_row("Secure Port", f"TCP :{self.port}")
 
         self.console.print(
             Panel(
                 info_table,
-                title="[bold green]✓ Enclave Online[/bold green]",
+                title="[bold green]✓ Enclave Coding Assistant Online[/bold green]",
                 border_style="green",
                 padding=(1, 2),
             )
@@ -253,8 +277,8 @@ class EnclaveTUI:
         await self._show_attestation()
 
         self.console.print(
-            "\n  [dim]Type [bold white]help[/bold white] for commands, "
-            "or just type a prompt to submit a task.[/dim]\n"
+            "\n  [dim]Type [bold white]/help[/bold white] for commands, "
+            "or just type a prompt to start coding.[/dim]\n"
         )
 
     async def shutdown(self) -> None:
@@ -306,36 +330,45 @@ class EnclaveTUI:
                 if not raw:
                     continue
 
-                parts = raw.split(maxsplit=1)
-                command = parts[0].lower()
-                args = parts[1] if len(parts) > 1 else ""
+                if raw.startswith("/"):
+                    parts = raw[1:].split(maxsplit=1)
+                    command = parts[0].lower()
+                    args = parts[1] if len(parts) > 1 else ""
 
-                if command in ("exit", "quit", "q"):
-                    break
-                elif command == "help":
-                    self._show_help()
-                elif command == "clear":
-                    self.console.clear()
-                elif command == "status":
-                    await self._show_status()
-                elif command == "attest":
-                    await self._show_attestation()
-                elif command == "model":
-                    await self._show_model_selector()
-                elif command == "history":
-                    self._show_history()
-                elif command == "inspect":
-                    self._show_inspect(args)
-                elif command == "task":
-                    if not args:
-                        self.console.print(
-                            "  [red]Usage:[/red] task <description>"
+                    if command in ("exit", "quit", "q"):
+                        break
+                    elif command == "help":
+                        self._show_coding_help()
+                    elif command == "clear":
+                        self._conversation_history.clear()
+                        self.console.print("  [green]Conversation history cleared.[/green]")
+                    elif command == "status":
+                        await self._show_coding_status()
+                    elif command == "cost":
+                        self.console.print(f"  [bold cyan]Session Cost Breakdown:[/bold cyan]")
+                        self.console.print(f"    Current Session Cost: [green]${self._session_cost:.6f}[/green]")
+                    elif command == "compact":
+                        self._compact_mode = not self._compact_mode
+                        status_str = "enabled" if self._compact_mode else "disabled"
+                        self.console.print(f"  [cyan]Compact mode {status_str}.[/cyan]")
+                    elif command == "model":
+                        await self._show_model_selector()
+                        # Regenerate system prompt with potentially new model/provider
+                        self._system_prompt = self.service.controller._planner.build_coding_system_prompt(
+                            self._project_root, self._project_tree
                         )
+                    elif command == "attest":
+                        await self._show_attestation()
+                    elif command == "task":
+                        if not args:
+                            self.console.print("  [red]Usage:[/red] /task <description>")
+                        else:
+                            await self._run_task(args)
                     else:
-                        await self._run_task(args)
+                        self.console.print(f"  [red]Unknown slash command: /{command}. Type /help for assistance.[/red]")
                 else:
-                    # Treat the entire input as a task description
-                    await self._run_task(raw)
+                    # Treat the entire input as a conversational message in coding mode
+                    await self._run_conversation_turn(raw)
 
             except KeyboardInterrupt:
                 break
@@ -344,6 +377,197 @@ class EnclaveTUI:
             except Exception as exc:
                 self.console.print(f"\n  [red]Error:[/red] {exc}")
                 self.console.print(f"  [dim]{traceback.format_exc()}[/dim]")
+
+    # ── Coding Assistant Helper Methods ──────────────────────────────────── #
+
+    def _find_project_root(self) -> Path:
+        """Find the project root by looking for a .git directory or pyproject.toml."""
+        current = Path.cwd().resolve()
+        for parent in [current] + list(current.parents):
+            if (parent / ".git").exists() or (parent / "pyproject.toml").exists():
+                return parent
+        return current
+
+    def _generate_project_tree(self) -> str:
+        """Generate a compact directory tree string, ignoring common build/temp dirs."""
+        ignored = {".git", "__pycache__", ".venv", "node_modules", ".enclave", ".gemini", "enclave.egg-info"}
+        lines = []
+
+        def walk(dir_path: Path, prefix: str = "", depth: int = 0):
+            if depth > 2:  # Limit depth to keep it compact
+                return
+            try:
+                entries = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            except OSError:
+                return
+
+            for i, entry in enumerate(entries):
+                if entry.name in ignored:
+                    continue
+                is_last = (i == len(entries) - 1)
+                connector = "└── " if is_last else "├── "
+
+                if entry.is_dir():
+                    lines.append(f"{prefix}{connector}{entry.name}/")
+                    new_prefix = prefix + ("    " if is_last else "│   ")
+                    walk(entry, new_prefix, depth + 1)
+                else:
+                    lines.append(f"{prefix}{connector}{entry.name}")
+
+        walk(self._project_root)
+        return "\n".join(lines) if lines else "(empty directory)"
+
+    async def _run_conversation_turn(self, user_message: str) -> None:
+        """Execute a conversation turn and stream the results to the console."""
+        self.console.print()
+        self.console.print(Rule(f"[bold cyan]Enclave Assistant[/bold cyan]", style="cyan"))
+
+        if not hasattr(self, "_system_prompt") or not self._system_prompt:
+            self._system_prompt = self.service.controller._planner.build_coding_system_prompt(
+                self._project_root, self._project_tree
+            )
+
+        event_queue = self.service.controller.enable_streaming()
+        turn_id = f"turn_{len(self._conversation_history)//2 + 1:03d}"
+
+        # Run the controller turn concurrently with event streaming
+        turn_task = asyncio.create_task(
+            self.service.controller.run_conversation_turn(
+                user_message=user_message,
+                conversation_history=self._conversation_history,
+                system_prompt=self._system_prompt,
+                task_id=turn_id,
+            )
+        )
+
+        in_response_block = False
+        current_step = 0
+
+        while not turn_task.done() or not event_queue.empty():
+            try:
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+
+                event_type = event.event_type
+                step_number = event.step_number
+                data = event.data
+
+                if event_type == "thinking":
+                    if in_response_block:
+                        self.console.print()
+                        in_response_block = False
+                    current_step = step_number
+                    if not self._compact_mode:
+                        self.console.print(f"\n[bold cyan]Step {step_number}: Thinking...[/bold cyan]")
+
+                elif event_type == "chunk":
+                    token = data.get("chunk", "")
+                    if not in_response_block:
+                        self.console.print("[green]Response: [/green]", end="")
+                        in_response_block = True
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+
+                elif event_type == "tool_call":
+                    if in_response_block:
+                        self.console.print()
+                        in_response_block = False
+                    tool_name = data.get("tool", "")
+                    args_keys = ", ".join(data.get("args_keys", []))
+                    if not self._compact_mode:
+                        self.console.print(f"  [bold yellow]⚡ {tool_name}({args_keys})[/bold yellow]")
+                    else:
+                        self.console.print(f" ⚡ [yellow]{tool_name}[/yellow] ", end="", flush=True)
+
+                elif event_type == "tool_result":
+                    if in_response_block:
+                        self.console.print()
+                        in_response_block = False
+                    tool_name = data.get("tool", "")
+                    success = data.get("success", False)
+                    latency = data.get("latency_ms", 0.0)
+                    status_str = "[green]✓[/green]" if success else "[red]✗[/red]"
+                    if not self._compact_mode:
+                        self.console.print(f"  {status_str} [dim]({latency:.1f}ms)[/dim]")
+                    else:
+                        self.console.print(f"{status_str} ", end="", flush=True)
+
+                elif event_type == "error":
+                    if in_response_block:
+                        self.console.print()
+                        in_response_block = False
+                    err = data.get("error", "Unknown error")
+                    self.console.print(f"\n[bold red]❌ Error: {err}[/bold red]")
+
+                event_queue.task_done()
+            except Exception:
+                break
+
+        if in_response_block:
+            self.console.print()
+
+        try:
+            response_text, updated_history, cost = await turn_task
+            self._conversation_history = updated_history
+            self._session_cost += cost
+
+            if not self._compact_mode:
+                self.console.print(
+                    Panel(
+                        Markdown(response_text),
+                        title="[bold green]✓ Enclave Response[/bold green]",
+                        border_style="green",
+                        padding=(1, 2),
+                    )
+                )
+                self.console.print(f"  [dim]Cost for this turn: ${cost:.6f} · Total: ${self._session_cost:.6f}[/dim]")
+            else:
+                self.console.print(Markdown(response_text))
+                self.console.print(f" [dim]Cost: ${cost:.6f}[/dim]")
+        except Exception as exc:
+            self.console.print(f"\n[bold red]❌ Turn Execution Failed: {exc}[/bold red]")
+
+    def _show_coding_help(self) -> None:
+        """Display help text for coding assistant mode."""
+        self._show_help()
+        self.console.print("""
+[bold cyan]Slash Commands (Conversational Mode):[/bold cyan]
+
+  [bold white]/help[/bold white]                 Show this help message
+  [bold white]/clear[/bold white]                Clear conversation history (start fresh)
+  [bold white]/model[/bold white]                Switch LLM provider / model
+  [bold white]/status[/bold white]               Show session stats (messages, cost, tokens)
+  [bold white]/cost[/bold white]                 Show detailed cost breakdown
+  [bold white]/compact[/bold white]              Toggle compact output mode
+  [bold white]/attest[/bold white]               Fetch and display attestation document
+  [bold white]/task <description>[/bold white]  Run a single-shot task via vsock
+  [bold white]/exit[/bold white] or [bold white]/quit[/bold white]        Exit the assistant
+
+[dim]Any other text you type will be sent to the AI assistant to search, read, edit or write files in your project.[/dim]
+""")
+
+    async def _show_coding_status(self) -> None:
+        """Display stats for the current conversational coding session."""
+        uptime = time.time() - self.boot_time
+        provider_label = _format_provider_label(
+            self.config.llm_provider, self.config.llm_model
+        )
+
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="bold cyan", width=18)
+        table.add_column()
+        table.add_row("Session Uptime", _format_duration(uptime))
+        table.add_row("Project Root", str(self._project_root))
+        table.add_row("LLM Provider", provider_label)
+        table.add_row("Messages", str(len(self._conversation_history)))
+        table.add_row("Session Cost", f"${self._session_cost:.6f}")
+        table.add_row("Compact Mode", "Enabled" if self._compact_mode else "Disabled")
+
+        self.console.print(
+            Panel(table, title="[bold cyan]Session Status[/bold cyan]", border_style="cyan", padding=(1, 2))
+        )
 
     # ── Commands ────────────────────────────────────────────────────────── #
 

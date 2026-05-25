@@ -170,6 +170,36 @@ class EnclaveService:
             extra={"count": len(self.tool_registry.list_tools())},
         )
 
+    def _register_coding_tools(self) -> None:
+        """Register Claude Code-style coding tools."""
+        from enclave.tools.bash_tool import BashTool
+        from enclave.tools.read_file import ReadFileTool
+        from enclave.tools.write_file import WriteFileTool
+        from enclave.tools.edit_file import EditFileTool
+        from enclave.tools.list_dir import ListDirTool
+        from enclave.tools.grep_search import GrepSearchTool
+        from enclave.tools.router import ToolRouter
+
+        self.tool_registry = ToolRegistry()
+
+        project_root = self.config.workspace_root
+        self.tool_registry.register(BashTool(cwd=project_root))
+        self.tool_registry.register(ReadFileTool(project_root=project_root))
+        self.tool_registry.register(WriteFileTool(project_root=project_root))
+        self.tool_registry.register(EditFileTool(project_root=project_root))
+        self.tool_registry.register(ListDirTool(project_root=project_root))
+        self.tool_registry.register(GrepSearchTool(project_root=project_root))
+
+        # Re-bind new registry in controller
+        self.controller._tool_registry = self.tool_registry
+        self.controller._router = ToolRouter(self.tool_registry)
+        self.controller._planner._registry = self.tool_registry
+
+        logger.info(
+            "coding_tools_registered",
+            extra={"count": len(self.tool_registry.list_tools())},
+        )
+
     def _register_handlers(self) -> None:
         """Register vsock message handlers."""
         self.server.register_handler("task_request", self._handle_task_request)

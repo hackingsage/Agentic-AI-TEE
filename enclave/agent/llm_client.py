@@ -291,12 +291,18 @@ def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]
         return []
     openai_tools = []
     for tool in tools:
+        import copy
+        # Deep copy input_schema to avoid modifying original registry schemas in place
+        parameters = copy.deepcopy(tool["input_schema"])
+        if "required" in parameters and not parameters["required"]:
+            parameters.pop("required", None)
+
         openai_tools.append({
             "type": "function",
             "function": {
                 "name": tool["name"],
                 "description": tool["description"],
-                "parameters": tool["input_schema"]
+                "parameters": parameters
             }
         })
     return openai_tools
@@ -903,7 +909,11 @@ class GroqClient(LLMClient):
 
                     if resp.status_code >= 400:
                         logger.error(f"Groq API error ({resp.status_code}): {resp.text}")
-                    resp.raise_for_status()
+                        raise httpx.HTTPStatusError(
+                            f"Groq API error ({resp.status_code}): {resp.text}",
+                            request=resp.request,
+                            response=resp
+                        )
                     data = resp.json()
                     break
             except httpx.HTTPError as exc:

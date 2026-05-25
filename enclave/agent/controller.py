@@ -366,3 +366,195 @@ class AgentController:
             total_cost_usd=total_cost,
             error="max_steps_exceeded",
         )
+
+    async def run_conversation_turn(
+        self,
+        user_message: str,
+        conversation_history: list[Message],
+        system_prompt: str,
+        *,
+        max_steps: int = 25,
+        max_cost: float = 2.0,
+        task_id: str = "",
+        timeout_seconds: float = 300.0,
+    ) -> tuple[str, list[Message], float]:
+        """Execute one conversation turn (user message → agent response).
+
+        Returns:
+            (response_text, updated_history, cost_usd)
+        """
+        # Append the new user message to conversation history
+        conversation_history.append(Message(role="user", content=user_message))
+
+        steps: list[StepResult] = []
+
+        async def _inner_loop():
+            for step_num in range(1, max_steps + 1):
+                # --- Guard: cost ---
+                current_cost = sum(s.cost_usd for s in steps)
+                if current_cost >= max_cost:
+                    logger.warning(
+                        "cost_guard_triggered",
+                        extra={
+                            "task_id": task_id,
+                            "cost_usd": round(current_cost, 4),
+                            "budget_usd": max_cost,
+                        },
+                    )
+                    err_msg = f"Cost budget exceeded: ${current_cost:.4f} >= ${max_cost}"
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="error",
+                        data={"error": err_msg},
+                    ))
+                    return f"Error: {err_msg}", current_cost
+
+                # --- Step 1: Call LLM ---
+                await self._emit_event(StepEvent(
+                    task_id=task_id,
+                    step_number=step_num,
+                    event_type="thinking",
+                    data={"status": "calling LLM"},
+                ))
+
+                async def on_chunk(token: str) -> None:
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="chunk",
+                        data={"chunk": token},
+                    ))
+
+                llm_response = await self._planner.plan_next_step(
+                    system_prompt=system_prompt,
+                    messages=conversation_history,
+                    task_id=task_id,
+                    step_number=step_num,
+                    on_chunk=on_chunk,
+                )
+
+                # --- Step 2: Check if task is complete (no tool_use blocks = done) ---
+                if not llm_response.has_tool_use:
+                    step = StepResult(
+                        step_number=step_num,
+                        llm_response=llm_response.text,
+                        input_tokens=llm_response.input_tokens,
+                        output_tokens=llm_response.output_tokens,
+                        latency_ms=llm_response.latency_ms,
+                    )
+                    steps.append(step)
+
+                    # Append assistant's final response message to history
+                    conversation_history.append(Message(role="assistant", content=llm_response.content))
+
+                    total_cost = sum(s.cost_usd for s in steps)
+
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="complete",
+                        data={"summary": llm_response.text},
+                    ))
+
+                    return llm_response.text, total_cost
+
+                # --- Step 3: Execute tool calls ---
+                # Append assistant message with tool calls to history
+                conversation_history.append(Message(role="assistant", content=llm_response.content))
+
+                tool_results: list[ToolResultBlock] = []
+                for i, tool_block in enumerate(llm_response.tool_use_blocks):
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="tool_call",
+                        data={"tool": tool_block.name, "args_keys": list(tool_block.input.keys())},
+                    ))
+
+                    tool_call = ToolCall(name=tool_block.name, args=tool_block.input)
+                    tool_output = await self._router.dispatch(
+                        tool_call,
+                        task_id=task_id,
+                        step_number=step_num,
+                    )
+
+                    # Collect result block
+                    tool_results.append(ToolResultBlock(
+                        tool_use_id=tool_block.id,
+                        content=str(tool_output.result) if tool_output.success
+                                else f"Error: {tool_output.error}",
+                        is_error=not tool_output.success,
+                    ))
+
+                    # Build step result
+                    # Only attribute LLM tokens/latency to the first tool result block
+                    step = StepResult(
+                        step_number=step_num,
+                        tool_name=tool_block.name,
+                        tool_args=tool_block.input,
+                        output=tool_output,
+                        llm_response=llm_response.text if i == 0 else "",
+                        input_tokens=llm_response.input_tokens if i == 0 else 0,
+                        output_tokens=llm_response.output_tokens if i == 0 else 0,
+                        latency_ms=llm_response.latency_ms if i == 0 else 0.0,
+                    )
+                    steps.append(step)
+
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="tool_result",
+                        data={
+                            "tool": tool_block.name,
+                            "success": tool_output.success,
+                            "latency_ms": round(tool_output.latency_ms, 2),
+                        },
+                    ))
+
+                # Feed all tool results back as a single user message
+                conversation_history.append(Message(role="user", content=tool_results))
+
+            # --- Guard: max steps reached ---
+            total_cost = sum(s.cost_usd for s in steps)
+            err_msg = f"Max steps ({max_steps}) reached without completion"
+            await self._emit_event(StepEvent(
+                task_id=task_id,
+                step_number=max_steps,
+                event_type="error",
+                data={"error": err_msg},
+            ))
+            return f"Error: {err_msg}", total_cost
+
+        try:
+            resp_text, cost = await asyncio.wait_for(_inner_loop(), timeout=timeout_seconds)
+            return resp_text, conversation_history, cost
+        except asyncio.TimeoutError:
+            err_msg = f"Conversation turn timed out after {timeout_seconds}s"
+            await self._emit_event(StepEvent(
+                task_id=task_id,
+                step_number=len(steps) + 1,
+                event_type="error",
+                data={"error": err_msg},
+            ))
+            total_cost = sum(s.cost_usd for s in steps)
+            return f"Error: {err_msg}", conversation_history, total_cost
+        except Exception as exc:
+            logger.error(
+                "conversation_turn_error",
+                extra={
+                    "task_id": task_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            err_msg = f"Conversation turn failed: {exc}"
+            await self._emit_event(StepEvent(
+                task_id=task_id,
+                step_number=len(steps) + 1,
+                event_type="error",
+                data={"error": err_msg},
+            ))
+            total_cost = sum(s.cost_usd for s in steps)
+            return f"Error: {err_msg}", conversation_history, total_cost
+
