@@ -146,16 +146,34 @@ class BrowserTool(BaseTool):
             html = html[:50000] + "\n... (truncated)"
         return ToolOutput(success=True, result=html)
 
-    def schema_xml(self) -> str:
-        return """<tool name="browser">
-  <description>Automate a headless web browser. Navigate, screenshot, click, type, and extract text from web pages.</description>
-  <args>
-    <arg name="operation" type="string" required="true">One of: "navigate", "screenshot", "click", "type_text", "get_text", "get_html"</arg>
-    <arg name="url" type="string" required="false">URL to navigate to (required for "navigate")</arg>
-    <arg name="selector" type="string" required="false">CSS selector for element targeting (required for "click", "type_text")</arg>
-    <arg name="text" type="string" required="false">Text to type (required for "type_text")</arg>
-  </args>
-</tool>"""
+    def tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["navigate", "screenshot", "click", "type_text", "get_text", "get_html"],
+                        "description": "The browser operation to perform",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL to navigate to (required for 'navigate')",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for element targeting (required for 'click', 'type_text')",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type (required for 'type_text')",
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
 
 
 class _MockPage:

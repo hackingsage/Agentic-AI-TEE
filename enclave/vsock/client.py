@@ -9,7 +9,7 @@ import asyncio
 import logging
 import socket
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 from enclave.vsock.protocol import MessageFrame, read_frame, write_frame
 
@@ -76,13 +76,51 @@ class VsockClient:
         try:
             await write_frame(writer, msg)
 
-            response = await asyncio.wait_for(
-                read_frame(reader),
-                timeout=effective_timeout,
-            )
+            while True:
+                response = await asyncio.wait_for(
+                    read_frame(reader),
+                    timeout=effective_timeout,
+                )
+                if response.msg_type != "step_event":
+                    return response
 
-            return response
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
+    async def send_stream(
+        self,
+        msg: MessageFrame,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[MessageFrame]:
+        """Send a message and yield response frames as they arrive.
+
+        Closes the connection after yielding the final task result or error frame.
+        """
+        effective_timeout = timeout or self._timeout
+
+        # Ensure request_id is set for correlation
+        if not msg.request_id:
+            msg.request_id = uuid.uuid4().hex[:12]
+
+        reader, writer = await self._connect()
+
+        try:
+            await write_frame(writer, msg)
+
+            while True:
+                response = await asyncio.wait_for(
+                    read_frame(reader),
+                    timeout=effective_timeout,
+                )
+                yield response
+                # Stop if we hit a terminal message type
+                if response.msg_type in ("task_result", "task_error", "error"):
+                    break
         finally:
             writer.close()
             try:

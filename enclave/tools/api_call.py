@@ -132,14 +132,35 @@ class APICallTool(BaseTool):
                 error=f"HTTP request failed: {type(exc).__name__}: {exc}",
             )
 
-    def schema_xml(self) -> str:
-        return """<tool name="api_call">
-  <description>Make HTTP requests to external APIs. Requests are filtered through a domain allowlist.</description>
-  <args>
-    <arg name="method" type="string" required="true">HTTP method: "GET", "POST", "PUT", "PATCH", "DELETE"</arg>
-    <arg name="url" type="string" required="true">Full URL to request</arg>
-    <arg name="headers" type="object" required="false">HTTP headers as key-value pairs</arg>
-    <arg name="body" type="string" required="false">Request body (string or JSON object)</arg>
-    <arg name="timeout" type="integer" required="false">Request timeout in seconds (default: 30, max: 120)</arg>
-  </args>
-</tool>"""
+    def tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                        "description": "HTTP method to use",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL to request",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "HTTP headers as key-value pairs",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Request body (string or JSON object)",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Request timeout in seconds (default: 30, max: 120)",
+                    },
+                },
+                "required": ["method", "url"],
+            },
+        }

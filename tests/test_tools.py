@@ -318,14 +318,14 @@ class TestToolRegistry:
             async def run(self, **kwargs):
                 return ToolOutput(success=True)
 
-            def schema_xml(self):
-                return "<tool />"
+            def tool_definition(self) -> dict[str, Any]:
+                return {"name": self.name, "description": self.description, "input_schema": {"type": "object", "properties": {}}}
 
         registry = ToolRegistry()
         with pytest.raises(ValueError, match="snake_case"):
             registry.register(BadTool())
 
-    def test_build_schema_xml(self) -> None:
+    def test_build_tool_definitions(self) -> None:
         from enclave.tools.base import ToolRegistry
         from enclave.tools.code_executor import CodeExecutor
         from enclave.tools.file_ops import FileSystem
@@ -333,9 +333,10 @@ class TestToolRegistry:
         registry = ToolRegistry()
         registry.register(CodeExecutor())
         registry.register(FileSystem())
-        xml = registry.build_schema_xml()
-        assert "code_exec" in xml
-        assert "file_ops" in xml
+        defs = registry.build_tool_definitions()
+        assert len(defs) == 2
+        assert defs[0]["name"] == "code_exec"
+        assert defs[1]["name"] == "file_ops"
 
 
 class TestToolRouter:

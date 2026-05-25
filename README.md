@@ -76,7 +76,18 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-### Run the Host API (Development)
+### Run the Interactive TUI (Recommended)
+
+Enclave includes a terminal interactive UI (TUI) that features real-time **Claude Code-style token and event streaming** (thinking steps, live text tokens, tool calls, and results) from the secure enclave:
+
+```bash
+source .venv/bin/activate
+python tui.py
+```
+
+Inside the TUI, you can submit tasks, switch models/providers, inspect history, verify attestation receipts, and observe the agent's reasoning process in real-time.
+
+### Run the Host API (Development Gateway)
 
 ```bash
 source .venv/bin/activate
@@ -100,12 +111,12 @@ uvicorn host.api.main:app --reload --port 8000
 TEE/
 ├── enclave/              # Runs inside the TEE
 │   ├── agent/            # AgentController, Planner, LLM client
-│   │   ├── controller.py # Main agent step loop
-│   │   ├── planner.py    # System prompt builder + XML parser
-│   │   ├── llm_client.py # Anthropic Claude + mock client
-│   │   └── models.py     # All dataclasses (TaskRequest, StepResult, etc.)
+│   │   ├── controller.py # Main agent step loop (native tool calling)
+│   │   ├── planner.py    # System prompt builder (native tool use parameters)
+│   │   ├── llm_client.py # Provider clients (Anthropic with streaming, OpenAI, etc.)
+│   │   └── models.py     # All dataclasses (Message, ContentBlock, StepEvent, etc.)
 │   ├── tools/            # Tool implementations
-│   │   ├── base.py       # BaseTool ABC + ToolRegistry
+│   │   ├── base.py       # BaseTool ABC + ToolRegistry (JSON tool definitions)
 │   │   ├── router.py     # ToolRouter (dispatch + validation)
 │   │   ├── code_executor.py
 │   │   ├── file_ops.py
@@ -121,13 +132,13 @@ TEE/
 │   │   └── state_db.py   # TaskStateDB (async SQLite)
 │   └── vsock/            # Enclave ↔ Host communication
 │       ├── protocol.py   # Length-prefix message framing
-│       ├── server.py     # Async vsock/TCP server
-│       └── client.py     # Async vsock/TCP client
+│       ├── server.py     # Async server (passes connection writer for streaming)
+│       └── client.py     # Async client (synchronous call & stream-iterator send)
 ├── host/                 # Runs outside the TEE (untrusted)
 │   ├── api/main.py       # FastAPI gateway
 │   └── attestation/      # Host-side attestation verifier
 ├── proxy/                # Go privacy proxy
-├── tests/                # Full test suite (102 tests)
+├── tests/                # Full test suite (114 tests)
 ├── docs/                 # Security whitepaper, guides
 └── pyproject.toml        # Project configuration
 ```

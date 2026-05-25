@@ -91,7 +91,12 @@ class VsockServer:
                     )
                 else:
                     try:
-                        response = await handler(msg)
+                        import inspect
+                        sig = inspect.signature(handler)
+                        if "writer" in sig.parameters:
+                            response = await handler(msg, writer=writer)
+                        else:
+                            response = await handler(msg)
                     except Exception as exc:
                         logger.error(
                             "handler_error",

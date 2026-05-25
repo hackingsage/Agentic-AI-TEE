@@ -9,11 +9,21 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
+import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Coroutine
 
-from enclave.agent.models import LLMResponse, Message
+from enclave.agent.models import (
+    LLMResponse,
+    Message,
+    TextBlock,
+    ToolUseBlock,
+    ToolResultBlock,
+    ContentBlock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +263,131 @@ PROVIDER_ENV_KEYS: dict[str, str] = {
     "mock": "",
 }
 
+
+# ─── Mapping Helpers ───────────────────────────────────────────────────────── #
+
+
+def _block_to_dict(block: ContentBlock) -> dict[str, Any]:
+    """Convert ContentBlock to Anthropic Messages API block structure."""
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    elif isinstance(block, ToolUseBlock):
+        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+    elif isinstance(block, ToolResultBlock):
+        res: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content
+        }
+        if block.is_error:
+            res["is_error"] = True
+        return res
+    raise ValueError(f"Unknown block type: {type(block)}")
+
+
+def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Anthropic-formatted tools to OpenAI-formatted tool schemas."""
+    if not tools:
+        return []
+    openai_tools = []
+    for tool in tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"]
+            }
+        })
+    return openai_tools
+
+
+def _convert_messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
+    """Convert Messages (with content blocks) to OpenAI-compatible messages API list."""
+    api_messages = []
+    for m in messages:
+        if isinstance(m.content, str):
+            api_messages.append({"role": m.role, "content": m.content})
+        else:
+            if m.role == "assistant":
+                text_content = ""
+                tool_calls = []
+                for b in m.content:
+                    if isinstance(b, TextBlock):
+                        text_content += b.text
+                    elif isinstance(b, ToolUseBlock):
+                        tool_calls.append({
+                            "id": b.id,
+                            "type": "function",
+                            "function": {
+                                "name": b.name,
+                                "arguments": json.dumps(b.input)
+                            }
+                        })
+                msg: dict[str, Any] = {"role": "assistant"}
+                if text_content:
+                    msg["content"] = text_content
+                elif not tool_calls:
+                    msg["content"] = ""
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                api_messages.append(msg)
+            elif m.role == "user":
+                is_tool_results = any(isinstance(b, ToolResultBlock) for b in m.content)
+                if is_tool_results:
+                    for b in m.content:
+                        if isinstance(b, ToolResultBlock):
+                            api_messages.append({
+                                "role": "tool",
+                                "tool_call_id": b.tool_use_id,
+                                "content": b.content
+                            })
+                        elif isinstance(b, TextBlock):
+                            api_messages.append({"role": "user", "content": b.text})
+                else:
+                    parts = []
+                    for b in m.content:
+                        if isinstance(b, TextBlock):
+                            parts.append({"type": "text", "text": b.text})
+                    api_messages.append({"role": "user", "content": parts})
+    return api_messages
+
+
+def _convert_tools_to_gemini(tools: list[dict[str, Any]]) -> list[Any]:
+    """Convert tools to google-genai types.Tool declarations."""
+    from google.genai import types
+    gemini_tools = []
+    
+    def convert_schema(s: dict[str, Any]) -> types.Schema:
+        t_type = s.get("type", "object").upper()
+        properties = {}
+        for k, v in s.get("properties", {}).items():
+            properties[k] = convert_schema(v)
+            
+        enum_vals = s.get("enum")
+        
+        return types.Schema(
+            type=t_type,
+            description=s.get("description"),
+            properties=properties or None,
+            required=s.get("required") or None,
+            enum=enum_vals or None,
+        )
+        
+    decls = []
+    for tool in tools:
+        decls.append(
+            types.FunctionDeclaration(
+                name=tool["name"],
+                description=tool["description"],
+                parameters=convert_schema(tool["input_schema"])
+            )
+        )
+    if decls:
+        gemini_tools.append(types.Tool(function_declarations=decls))
+    return gemini_tools
+
+
 # ─── Abstract Base ──────────────────────────────────────────────────────────── #
 
 
@@ -265,21 +400,24 @@ class LLMClient(ABC):
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         """Call the LLM with a system prompt and message history.
 
         Args:
             system: System prompt.
             messages: Conversation history.
+            tools: Registered tool definitions.
             max_tokens: Maximum output tokens.
             task_id: For structured logging only.
             step_number: For structured logging only.
 
         Returns:
-            LLMResponse with text, token counts, and latency.
+            LLMResponse with structured content blocks, token counts, and latency.
         """
         raise NotImplementedError
 
@@ -303,47 +441,83 @@ class AnthropicClient(LLMClient):
         self._model = model
         self._api_key = api_key
         self._base_url = base_url
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            import anthropic
+            client_kwargs: dict[str, Any] = {}
+            if self._api_key:
+                client_kwargs["api_key"] = self._api_key
+            if self._base_url:
+                client_kwargs["base_url"] = self._base_url
+            self._client = anthropic.AsyncAnthropic(**client_kwargs)
+        return self._client
 
     async def call(
         self,
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
-        import anthropic
+        client = self._get_client()
 
         start = time.monotonic()
 
-        client_kwargs: dict[str, Any] = {}
-        if self._api_key:
-            client_kwargs["api_key"] = self._api_key
-        if self._base_url:
-            client_kwargs["base_url"] = self._base_url
+        api_messages = []
+        for m in messages:
+            if isinstance(m.content, str):
+                api_messages.append({"role": m.role, "content": m.content})
+            else:
+                api_messages.append({
+                    "role": m.role,
+                    "content": [_block_to_dict(b) for b in m.content]
+                })
 
-        client = anthropic.AsyncAnthropic(**client_kwargs)
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": api_messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
 
-        api_messages = [{"role": m.role, "content": m.content} for m in messages]
-
-        response = await client.messages.create(
-            model=self._model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=api_messages,
-        )
+        if on_chunk is not None:
+            async with client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        await on_chunk(event.delta.text)
+            response = await stream.get_final_message()
+        else:
+            response = await client.messages.create(**kwargs)
 
         elapsed_ms = (time.monotonic() - start) * 1000
 
+        content_blocks: list[ContentBlock] = []
+        for block in response.content:
+            if block.type == "text":
+                content_blocks.append(TextBlock(text=block.text))
+            elif block.type == "tool_use":
+                content_blocks.append(ToolUseBlock(
+                    id=block.id,
+                    name=block.name,
+                    input=block.input
+                ))
+
         result = LLMResponse(
-            text=response.content[0].text,
+            content=content_blocks,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             latency_ms=elapsed_ms,
+            stop_reason=response.stop_reason or "",
         )
 
-        # Structured logging — never log content
         logger.info(
             "llm_call",
             extra={
@@ -364,10 +538,7 @@ class AnthropicClient(LLMClient):
 
 
 class OpenAIClient(LLMClient):
-    """OpenAI API client (GPT-4o, o3-mini, etc.).
-
-    Uses the official openai async client.
-    """
+    """OpenAI API client (GPT-4o, o3-mini, etc.)."""
 
     def __init__(
         self,
@@ -378,56 +549,89 @@ class OpenAIClient(LLMClient):
         self._model = model
         self._api_key = api_key
         self._base_url = base_url
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError:
+                raise RuntimeError(
+                    "OpenAI SDK not installed. Run: pip install -e '.[openai]'"
+                )
+            client_kwargs: dict[str, Any] = {}
+            if self._api_key:
+                client_kwargs["api_key"] = self._api_key
+            if self._base_url:
+                client_kwargs["base_url"] = self._base_url
+            self._client = AsyncOpenAI(**client_kwargs)
+        return self._client
 
     async def call(
         self,
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
-        try:
-            from openai import AsyncOpenAI
-        except ImportError:
-            raise RuntimeError(
-                "OpenAI SDK not installed. Run: pip install -e '.[openai]'"
-            )
+        client = self._get_client()
 
         start = time.monotonic()
 
-        client_kwargs: dict[str, Any] = {}
-        if self._api_key:
-            client_kwargs["api_key"] = self._api_key
-        if self._base_url:
-            client_kwargs["base_url"] = self._base_url
+        api_messages = [{"role": "system", "content": system}]
+        api_messages.extend(_convert_messages_to_openai(messages))
 
-        client = AsyncOpenAI(**client_kwargs)
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "messages": api_messages,
+        }
+        if tools:
+            kwargs["tools"] = _convert_tools_to_openai(tools)
 
-        # Build messages with system prompt
-        api_messages: list[dict[str, str]] = [
-            {"role": "system", "content": system},
-        ]
-        for m in messages:
-            api_messages.append({"role": m.role, "content": m.content})
-
-        response = await client.chat.completions.create(
-            model=self._model,
-            max_tokens=max_tokens,
-            messages=api_messages,
-        )
+        response = await client.chat.completions.create(**kwargs)
 
         elapsed_ms = (time.monotonic() - start) * 1000
 
         choice = response.choices[0]
         usage = response.usage
 
+        content_blocks: list[ContentBlock] = []
+        if choice.message.content:
+            content_blocks.append(TextBlock(text=choice.message.content))
+
+        if choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except Exception:
+                    args = {}
+                content_blocks.append(ToolUseBlock(
+                    id=tc.id,
+                    name=tc.function.name,
+                    input=args
+                ))
+
+        stop_reason = ""
+        if choice.finish_reason == "stop":
+            stop_reason = "end_turn"
+        elif choice.finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif choice.finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = choice.finish_reason or ""
+
         result = LLMResponse(
-            text=choice.message.content or "",
+            content=content_blocks,
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
             latency_ms=elapsed_ms,
+            stop_reason=stop_reason,
         )
 
         logger.info(
@@ -450,12 +654,7 @@ class OpenAIClient(LLMClient):
 
 
 class OpenRouterClient(LLMClient):
-    """OpenRouter API client — access any model via a single API.
-
-    OpenRouter provides an OpenAI-compatible API at https://openrouter.ai/api/v1
-    that routes to 200+ models from all major providers. Uses httpx directly
-    to avoid requiring the openai SDK as a dependency.
-    """
+    """OpenRouter API client."""
 
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -474,20 +673,19 @@ class OpenRouterClient(LLMClient):
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         import httpx
+        import asyncio
 
         start = time.monotonic()
 
-        # Build OpenAI-compatible messages
-        api_messages: list[dict[str, str]] = [
-            {"role": "system", "content": system},
-        ]
-        for m in messages:
-            api_messages.append({"role": m.role, "content": m.content})
+        api_messages = [{"role": "system", "content": system}]
+        api_messages.extend(_convert_messages_to_openai(messages))
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -496,10 +694,16 @@ class OpenRouterClient(LLMClient):
             "X-Title": "Enclave TEE Agent",
         }
 
-        import asyncio
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "messages": api_messages,
+        }
+        if tools:
+            payload["tools"] = _convert_tools_to_openai(tools)
 
         max_retries = 6
-        backoff = 2.0  # initial sleep duration in seconds
+        backoff = 2.0
         data = {}
 
         for attempt in range(max_retries + 1):
@@ -508,15 +712,10 @@ class OpenRouterClient(LLMClient):
                     resp = await client.post(
                         f"{self._base_url}/chat/completions",
                         headers=headers,
-                        json={
-                            "model": self._model,
-                            "max_tokens": max_tokens,
-                            "messages": api_messages,
-                        },
+                        json=payload,
                     )
 
                     if resp.status_code == 429:
-                        # Check Retry-After header or use backoff
                         retry_after = resp.headers.get("Retry-After")
                         wait_time = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
                         logger.warning(
@@ -556,14 +755,47 @@ class OpenRouterClient(LLMClient):
         elapsed_ms = (time.monotonic() - start) * 1000
 
         choices = data.get("choices", [{}])
-        text = choices[0].get("message", {}).get("content", "") if choices else ""
+        choice = choices[0] if choices else {}
+        message_data = choice.get("message", {})
+        text = message_data.get("content", "")
+        tool_calls = message_data.get("tool_calls", [])
         usage = data.get("usage", {})
 
+        content_blocks: list[ContentBlock] = []
+        if text:
+            content_blocks.append(TextBlock(text=text))
+
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            try:
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+            except Exception:
+                args = {}
+            content_blocks.append(ToolUseBlock(
+                id=tc.get("id", f"call_{uuid.uuid4().hex[:16]}"),
+                name=func.get("name", ""),
+                input=args
+            ))
+
+        finish_reason = choice.get("finish_reason", "")
+        stop_reason = ""
+        if finish_reason == "stop":
+            stop_reason = "end_turn"
+        elif finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = finish_reason or ""
+
         result = LLMResponse(
-            text=text,
+            content=content_blocks,
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
             latency_ms=elapsed_ms,
+            stop_reason=stop_reason,
         )
 
         logger.info(
@@ -586,12 +818,7 @@ class OpenRouterClient(LLMClient):
 
 
 class GroqClient(LLMClient):
-    """Groq API client — access high-speed open-weight models.
-
-    Groq provides an OpenAI-compatible API at https://api.groq.com/openai/v1
-    that routes to high-speed Llama, Mixtral, Gemma, and DeepSeek models.
-    Uses httpx directly to avoid requiring the groq SDK as a dependency.
-    """
+    """Groq API client."""
 
     GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -610,29 +837,35 @@ class GroqClient(LLMClient):
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         import httpx
         import asyncio
 
         start = time.monotonic()
 
-        # Build OpenAI-compatible messages
-        api_messages: list[dict[str, str]] = [
-            {"role": "system", "content": system},
-        ]
-        for m in messages:
-            api_messages.append({"role": m.role, "content": m.content})
+        api_messages = [{"role": "system", "content": system}]
+        api_messages.extend(_convert_messages_to_openai(messages))
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
 
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "messages": api_messages,
+        }
+        if tools:
+            payload["tools"] = _convert_tools_to_openai(tools)
+
         max_retries = 6
-        backoff = 2.0  # initial sleep duration in seconds
+        backoff = 2.0
         data = {}
 
         for attempt in range(max_retries + 1):
@@ -641,15 +874,10 @@ class GroqClient(LLMClient):
                     resp = await client.post(
                         f"{self._base_url}/chat/completions",
                         headers=headers,
-                        json={
-                            "model": self._model,
-                            "max_tokens": max_tokens,
-                            "messages": api_messages,
-                        },
+                        json=payload,
                     )
 
                     if resp.status_code == 429:
-                        # Check Retry-After header or use backoff
                         retry_after = resp.headers.get("Retry-After")
                         wait_time = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
                         logger.warning(
@@ -673,6 +901,8 @@ class GroqClient(LLMClient):
                         backoff *= 2
                         continue
 
+                    if resp.status_code >= 400:
+                        logger.error(f"Groq API error ({resp.status_code}): {resp.text}")
                     resp.raise_for_status()
                     data = resp.json()
                     break
@@ -689,14 +919,47 @@ class GroqClient(LLMClient):
         elapsed_ms = (time.monotonic() - start) * 1000
 
         choices = data.get("choices", [{}])
-        text = choices[0].get("message", {}).get("content", "") if choices else ""
+        choice = choices[0] if choices else {}
+        message_data = choice.get("message", {})
+        text = message_data.get("content", "")
+        tool_calls = message_data.get("tool_calls", [])
         usage = data.get("usage", {})
 
+        content_blocks: list[ContentBlock] = []
+        if text:
+            content_blocks.append(TextBlock(text=text))
+
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            try:
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+            except Exception:
+                args = {}
+            content_blocks.append(ToolUseBlock(
+                id=tc.get("id", f"call_{uuid.uuid4().hex[:16]}"),
+                name=func.get("name", ""),
+                input=args
+            ))
+
+        finish_reason = choice.get("finish_reason", "")
+        stop_reason = ""
+        if finish_reason == "stop":
+            stop_reason = "end_turn"
+        elif finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = finish_reason or ""
+
         result = LLMResponse(
-            text=text,
+            content=content_blocks,
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
             latency_ms=elapsed_ms,
+            stop_reason=stop_reason,
         )
 
         logger.info(
@@ -719,10 +982,7 @@ class GroqClient(LLMClient):
 
 
 class GeminiClient(LLMClient):
-    """Google Gemini API client.
-
-    Uses the official google-genai SDK.
-    """
+    """Google Gemini API client."""
 
     def __init__(
         self,
@@ -737,9 +997,11 @@ class GeminiClient(LLMClient):
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         try:
             from google import genai
@@ -753,19 +1015,54 @@ class GeminiClient(LLMClient):
 
         client = genai.Client(api_key=self._api_key)
 
-        # Build contents: system instruction is separate in Gemini
+        # Build contents
         contents: list[types.Content] = []
         for m in messages:
             role = "model" if m.role == "assistant" else "user"
-            contents.append(types.Content(
-                role=role,
-                parts=[types.Part(text=m.content)],
-            ))
+            parts = []
+            if isinstance(m.content, str):
+                parts.append(types.Part(text=m.content))
+            else:
+                for b in m.content:
+                    if isinstance(b, TextBlock):
+                        parts.append(types.Part(text=b.text))
+                    elif isinstance(b, ToolUseBlock):
+                        parts.append(types.Part(
+                            function_call=types.FunctionCall(
+                                name=b.name,
+                                args=b.input
+                            )
+                        ))
+                    elif isinstance(b, ToolResultBlock):
+                        # Find the corresponding tool name by tracing preceding assistant messages
+                        tool_name = ""
+                        for prev_msg in messages:
+                            if not isinstance(prev_msg.content, str):
+                                for prev_block in prev_msg.content:
+                                    if isinstance(prev_block, ToolUseBlock) and prev_block.id == b.tool_use_id:
+                                        tool_name = prev_block.name
+                                        break
+                            if tool_name:
+                                break
+                        if not tool_name:
+                            tool_name = "unknown_tool"
+                        
+                        parts.append(types.Part(
+                            function_response=types.FunctionResponse(
+                                name=tool_name,
+                                response={"result": b.content}
+                            )
+                        ))
+            contents.append(types.Content(role=role, parts=parts))
 
-        config = types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=max_tokens,
-        )
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system,
+            "max_output_tokens": max_tokens,
+        }
+        if tools:
+            config_kwargs["tools"] = _convert_tools_to_gemini(tools)
+
+        config = types.GenerateContentConfig(**config_kwargs)
 
         response = await client.aio.models.generate_content(
             model=self._model,
@@ -775,7 +1072,31 @@ class GeminiClient(LLMClient):
 
         elapsed_ms = (time.monotonic() - start) * 1000
 
-        text = response.text or ""
+        content_blocks: list[ContentBlock] = []
+        if response.text:
+            content_blocks.append(TextBlock(text=response.text))
+
+        if response.function_calls:
+            for fc in response.function_calls:
+                content_blocks.append(ToolUseBlock(
+                    id=f"call_{uuid.uuid4().hex[:16]}",
+                    name=fc.name,
+                    input=fc.args
+                ))
+
+        stop_reason = ""
+        if response.candidates:
+            finish_reason = response.candidates[0].finish_reason
+            if finish_reason == "STOP" or finish_reason == "stop":
+                if response.function_calls:
+                    stop_reason = "tool_use"
+                else:
+                    stop_reason = "end_turn"
+            elif finish_reason == "MAX_TOKENS" or finish_reason == "max_tokens":
+                stop_reason = "max_tokens"
+            else:
+                stop_reason = str(finish_reason)
+
         input_tokens = 0
         output_tokens = 0
         if response.usage_metadata:
@@ -783,10 +1104,11 @@ class GeminiClient(LLMClient):
             output_tokens = response.usage_metadata.candidates_token_count or 0
 
         result = LLMResponse(
-            text=text,
+            content=content_blocks,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=elapsed_ms,
+            stop_reason=stop_reason,
         )
 
         logger.info(
@@ -809,11 +1131,7 @@ class GeminiClient(LLMClient):
 
 
 class OllamaClient(LLMClient):
-    """Ollama local LLM client.
-
-    Connects to a local Ollama instance via its REST API.
-    No API key required. Uses httpx (already a project dependency).
-    """
+    """Ollama local LLM client."""
 
     def __init__(
         self,
@@ -828,47 +1146,75 @@ class OllamaClient(LLMClient):
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         import httpx
 
         start = time.monotonic()
 
-        # Build Ollama chat messages
-        api_messages: list[dict[str, str]] = [
-            {"role": "system", "content": system},
-        ]
-        for m in messages:
-            api_messages.append({"role": m.role, "content": m.content})
+        api_messages = [{"role": "system", "content": system}]
+        api_messages.extend(_convert_messages_to_openai(messages))
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": api_messages,
+            "stream": False,
+            "options": {
+                "num_predict": max_tokens,
+            },
+        }
+        if tools:
+            payload["tools"] = _convert_tools_to_openai(tools)
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
                 f"{self._base_url}/api/chat",
-                json={
-                    "model": self._model,
-                    "messages": api_messages,
-                    "stream": False,
-                    "options": {
-                        "num_predict": max_tokens,
-                    },
-                },
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()
 
         elapsed_ms = (time.monotonic() - start) * 1000
 
-        text = data.get("message", {}).get("content", "")
+        message_data = data.get("message", {})
+        text = message_data.get("content", "")
+        tool_calls = message_data.get("tool_calls", [])
+
+        content_blocks: list[ContentBlock] = []
+        if text:
+            content_blocks.append(TextBlock(text=text))
+
+        for tc in tool_calls:
+            function_data = tc.get("function", {})
+            try:
+                args = function_data.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+            except Exception:
+                args = {}
+            content_blocks.append(ToolUseBlock(
+                id=tc.get("id", f"call_{uuid.uuid4().hex[:16]}"),
+                name=function_data.get("name", ""),
+                input=args
+            ))
+
+        stop_reason = "end_turn"
+        if tool_calls:
+            stop_reason = "tool_use"
+
         input_tokens = data.get("prompt_eval_count", 0) or 0
         output_tokens = data.get("eval_count", 0) or 0
 
         result = LLMResponse(
-            text=text,
+            content=content_blocks,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=elapsed_ms,
+            stop_reason=stop_reason,
         )
 
         logger.info(
@@ -893,11 +1239,10 @@ class OllamaClient(LLMClient):
 class MockLLMClient(LLMClient):
     """Mock LLM client for testing.
 
-    Returns predefined responses in sequence. When responses are exhausted,
-    returns a default task_complete response.
+    Accepts predefined responses (XML string fallbacks or structured content lists/LLMResponse objects).
     """
 
-    def __init__(self, responses: list[str] | None = None) -> None:
+    def __init__(self, responses: list[Any] | None = None) -> None:
         self._responses = list(responses) if responses else []
         self._call_count = 0
         self._calls: list[dict[str, Any]] = []
@@ -916,9 +1261,11 @@ class MockLLMClient(LLMClient):
         system: str,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         task_id: str = "",
         step_number: int = 0,
+        on_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> LLMResponse:
         self._calls.append({
             "system": system,
@@ -926,26 +1273,85 @@ class MockLLMClient(LLMClient):
             "max_tokens": max_tokens,
             "task_id": task_id,
             "step_number": step_number,
+            "tools": tools,
         })
 
         if self._call_count < len(self._responses):
-            text = self._responses[self._call_count]
+            res_obj = self._responses[self._call_count]
         else:
-            # Default: return task_complete
-            text = (
+            res_obj = (
                 "<thinking>All steps complete.</thinking>\n"
                 "<task_complete>\n"
                 "  <summary>Task completed successfully.</summary>\n"
                 "</task_complete>"
             )
 
+        content_blocks: list[ContentBlock] = []
+        stop_reason = "end_turn"
+
+        if isinstance(res_obj, LLMResponse):
+            self._call_count += 1
+            return res_obj
+        elif isinstance(res_obj, list):
+            content_blocks = res_obj
+            stop_reason = "tool_use" if any(isinstance(b, ToolUseBlock) for b in content_blocks) else "end_turn"
+        elif isinstance(res_obj, str):
+            # Parse XML fallback for backward compatibility with existing tests
+            thinking_match = re.search(r"<thinking>(.*?)</thinking>", res_obj, re.DOTALL)
+            if thinking_match:
+                content_blocks.append(TextBlock(text=thinking_match.group(1).strip()))
+
+            tool_calls = re.findall(r"<tool_call>(.*?)</tool_call>", res_obj, re.DOTALL)
+            for tc_str in tool_calls:
+                stop_reason = "tool_use"
+                name_match = re.search(r"<name>(.*?)</name>", tc_str, re.DOTALL)
+                name = name_match.group(1).strip() if name_match else ""
+
+                args: dict[str, Any] = {}
+                args_match = re.search(r"<args>(.*?)</args>", tc_str, re.DOTALL)
+                if args_match:
+                    args_str = args_match.group(1).strip()
+                    # extract tag/value parameters
+                    params = re.findall(r"<(.*?)>(.*?)</\1>", args_str, re.DOTALL)
+                    for k, v in params:
+                        val = v.strip()
+                        if val.lower() == "true":
+                            args[k] = True
+                        elif val.lower() == "false":
+                            args[k] = False
+                        elif val.isdigit():
+                            args[k] = int(val)
+                        else:
+                            try:
+                                args[k] = float(val)
+                            except ValueError:
+                                args[k] = val
+
+                content_blocks.append(ToolUseBlock(
+                    id=f"call_{uuid.uuid4().hex[:16]}",
+                    name=name,
+                    input=args
+                ))
+
+            complete_match = re.search(r"<task_complete>(.*?)</task_complete>", res_obj, re.DOTALL)
+            if complete_match:
+                summary_match = re.search(r"<summary>(.*?)</summary>", complete_match.group(1), re.DOTALL)
+                summary = summary_match.group(1).strip() if summary_match else complete_match.group(1).strip()
+                content_blocks.append(TextBlock(text=summary))
+
+            if not content_blocks:
+                content_blocks.append(TextBlock(text=res_obj))
+        else:
+            raise TypeError(f"Unsupported mock response type: {type(res_obj)}")
+
         self._call_count += 1
 
         return LLMResponse(
-            text=text,
+            content=content_blocks,
             input_tokens=100 * len(messages),
-            output_tokens=len(text),
+            output_tokens=len(res_obj) if isinstance(res_obj, str) else 10,
             latency_ms=50.0,
+            stop_reason=stop_reason,
         )
 
 
@@ -958,20 +1364,7 @@ def create_llm_client(
     api_key: str = "",
     base_url: str = "",
 ) -> LLMClient:
-    """Factory function to create an LLM client from configuration.
-
-    Args:
-        provider: One of "anthropic", "openai", "gemini", "openrouter", "ollama", "mock".
-        model: Model identifier (e.g. "gpt-4o", "gemini-2.5-flash").
-        api_key: Provider API key (not needed for ollama/mock).
-        base_url: Optional override for the API endpoint.
-
-    Returns:
-        Configured LLMClient instance.
-
-    Raises:
-        ValueError: If the provider is not recognized.
-    """
+    """Factory function to create an LLM client from configuration."""
     provider = provider.lower().strip()
 
     if provider == "anthropic":
@@ -1018,40 +1411,28 @@ def create_llm_client(
 
 
 def get_available_providers() -> dict[str, bool]:
-    """Check which providers have API keys configured or are available.
-
-    Returns:
-        Dict of provider → is_available.
-    """
+    """Check which providers have API keys configured or are available."""
     import os
 
     available: dict[str, bool] = {
-        "mock": True,  # Always available
+        "mock": True,
     }
 
-    # Anthropic
     if os.getenv("ANTHROPIC_API_KEY"):
         available["anthropic"] = True
 
-    # OpenAI
     if os.getenv("OPENAI_API_KEY"):
         available["openai"] = True
 
-    # Gemini
     if os.getenv("GOOGLE_API_KEY"):
         available["gemini"] = True
 
-    # OpenRouter
     if os.getenv("OPENROUTER_API_KEY"):
         available["openrouter"] = True
 
-    # Groq
     if os.getenv("GROQ_API_KEY"):
         available["groq"] = True
 
-    # Ollama — check if the SDK-less REST API is reachable
-    # We just mark it as available and let the user try; connection errors
-    # will surface at call time.
     available["ollama"] = True
 
     return available

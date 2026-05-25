@@ -29,7 +29,7 @@ from enclave.tools.browser_tool import BrowserTool
 from enclave.tools.code_executor import CodeExecutor
 from enclave.tools.file_ops import FileSystem
 from enclave.tools.memory_tool import MemoryTool
-from enclave.vsock.protocol import MessageFrame
+from enclave.vsock.protocol import MessageFrame, write_frame
 from enclave.vsock.server import VsockServer
 
 # --------------------------------------------------------------------------- #
@@ -180,92 +180,123 @@ class EnclaveService:
 
     # ---- Message Handlers ---- #
 
-    async def _handle_task_request(self, msg: MessageFrame) -> MessageFrame:
+    async def _handle_task_request(self, msg: MessageFrame, *, writer: asyncio.StreamWriter | None = None) -> MessageFrame:
         """Handle a task_request message from the host."""
-        payload = msg.payload
-        task = TaskRequest(
-            task_id=payload.get("task_id", ""),
-            user_id=payload.get("user_id", "anonymous"),
-            description=payload.get("description", ""),
-            max_steps=payload.get("max_steps", self.config.default_max_steps),
-            budget_usd=payload.get("budget_usd", self.config.default_budget),
-            timeout_seconds=payload.get("timeout_seconds", self.config.default_timeout),
-        )
-
-        if not task.description:
-            return MessageFrame(
-                msg_type="task_error",
-                payload={"error": "Empty task description"},
-                request_id=msg.request_id,
+        try:
+            payload = msg.payload
+            task = TaskRequest(
+                task_id=payload.get("task_id", ""),
+                user_id=payload.get("user_id", "anonymous"),
+                description=payload.get("description", ""),
+                max_steps=payload.get("max_steps", self.config.default_max_steps),
+                budget_usd=payload.get("budget_usd", self.config.default_budget),
+                timeout_seconds=payload.get("timeout_seconds", self.config.default_timeout),
             )
 
-        logger.info("task_received", extra={"task_id": task.task_id})
+            if not task.description:
+                return MessageFrame(
+                    msg_type="task_error",
+                    payload={"error": "Empty task description"},
+                    request_id=msg.request_id,
+                )
 
-        # Record in state DB
-        await self.state_db.create_task(task)
+            logger.info("task_received", extra={"task_id": task.task_id})
 
-        # Run the task
-        result = await self.controller.run_task(task)
+            # Record in state DB
+            await self.state_db.create_task(task)
 
-        # Record completion
-        await self.state_db.complete_task(result)
+            # Setup streaming if writer is available
+            stream_task = None
+            if writer is not None:
+                event_queue = self.controller.enable_streaming()
 
-        # Record individual steps
-        for step in result.steps:
-            await self.state_db.record_step(task.task_id, step)
+                async def stream_events_loop():
+                    try:
+                        while True:
+                            event = await event_queue.get()
+                            frame = MessageFrame(
+                                msg_type="step_event",
+                                payload={
+                                    "task_id": event.task_id,
+                                    "step_number": event.step_number,
+                                    "event_type": event.event_type,
+                                    "data": event.data,
+                                    "timestamp": event.timestamp,
+                                },
+                                request_id=msg.request_id,
+                            )
+                            await write_frame(writer, frame)
+                            event_queue.task_done()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"Error streaming task events: {e}")
 
-        # Build attestation receipt
-        attestation_doc = await self.attestation.get_document(
-            user_data=result.attestation_hash.encode() if result.attestation_hash else None,
-        )
+                stream_task = asyncio.create_task(stream_events_loop())
 
-        receipt = {
-            "task_id": result.task_id,
-            "task_hash": result.attestation_hash or "",
-            "pcrs": {str(k): v.hex() for k, v in attestation_doc.pcrs.items()},
-            "signature": self.key_manager.sign_detached(
-                (result.attestation_hash or "").encode()
-            ).hex(),
-        }
+            try:
+                # Run the task
+                result = await self.controller.run_task(task)
+            finally:
+                if stream_task is not None:
+                    stream_task.cancel()
+                    try:
+                        await stream_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
-        # Extract the final LLM response text for display in the TUI,
-        # scanning backwards through steps to find a non-empty response,
-        # and stripping XML blocks (thinking, tool_call, task_complete) to get clean text.
-        response_text = ""
-        if result.steps:
-            import re
-            for step in reversed(result.steps):
-                if step.llm_response:
-                    cleaned = step.llm_response
-                    cleaned = re.sub(r"<thinking>.*?</thinking>", "", cleaned, flags=re.DOTALL)
-                    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL)
-                    cleaned = re.sub(r"<task_complete>.*?</task_complete>", "", cleaned, flags=re.DOTALL)
-                    cleaned = cleaned.strip()
-                    if cleaned:
-                        response_text = cleaned
-                        break
-            if not response_text:
-                last_step_text = result.steps[-1].llm_response or ""
-                cleaned = re.sub(r"<thinking>.*?</thinking>", "", last_step_text, flags=re.DOTALL)
-                cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL)
-                cleaned = re.sub(r"<task_complete>.*?</task_complete>", "", cleaned, flags=re.DOTALL)
-                response_text = cleaned.strip() or result.summary
+            # Record completion
+            await self.state_db.complete_task(result)
 
-        return MessageFrame(
-            msg_type="task_result",
-            payload={
+            # Record individual steps
+            for step in result.steps:
+                await self.state_db.record_step(task.task_id, step)
+
+            # Build attestation receipt
+            attestation_doc = await self.attestation.get_document(
+                user_data=result.attestation_hash.encode() if result.attestation_hash else None,
+            )
+
+            receipt = {
                 "task_id": result.task_id,
-                "success": result.success,
-                "summary": result.summary,
-                "response": response_text,
-                "total_cost_usd": result.total_cost_usd,
-                "elapsed_seconds": result.elapsed_seconds,
-                "steps_count": len(result.steps),
-                "error": result.error,
-                "attestation": receipt,
-            },
-            request_id=msg.request_id,
-        )
+                "task_hash": result.attestation_hash or "",
+                "pcrs": {str(k): v.hex() for k, v in attestation_doc.pcrs.items()},
+                "signature": self.key_manager.sign_detached(
+                    (result.attestation_hash or "").encode()
+                ).hex(),
+            }
+
+            # Extract the final LLM response text for display in the TUI,
+            # scanning backwards through steps to find a non-empty response.
+            response_text = ""
+            if result.steps:
+                for step in reversed(result.steps):
+                    if step.llm_response:
+                        cleaned = step.llm_response.strip()
+                        if cleaned:
+                            response_text = cleaned
+                            break
+                if not response_text:
+                    response_text = (result.steps[-1].llm_response or "").strip() or result.summary
+
+            return MessageFrame(
+                msg_type="task_result",
+                payload={
+                    "task_id": result.task_id,
+                    "success": result.success,
+                    "summary": result.summary,
+                    "response": response_text,
+                    "total_cost_usd": result.total_cost_usd,
+                    "elapsed_seconds": result.elapsed_seconds,
+                    "steps_count": len(result.steps),
+                    "error": result.error,
+                    "attestation": receipt,
+                },
+                request_id=msg.request_id,
+            )
+        except Exception as e:
+            logger.error(f"Error handling task request: {e}", exc_info=True)
+            raise
 
     async def _handle_attest(self, msg: MessageFrame) -> MessageFrame:
         """Return a fresh attestation document."""

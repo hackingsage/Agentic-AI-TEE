@@ -187,12 +187,27 @@ class FileSystem(BaseTool):
         file_type = "directory" if safe_path.is_dir() else "file" if safe_path.is_file() else "none"
         return ToolOutput(success=True, result={"exists": exists, "type": file_type})
 
-    def schema_xml(self) -> str:
-        return """<tool name="file_ops">
-  <description>Perform file operations in the task workspace. All paths are relative to the workspace root.</description>
-  <args>
-    <arg name="operation" type="string" required="true">One of: "read", "write", "list", "delete", "exists"</arg>
-    <arg name="path" type="string" required="true">Relative file path (not required for "list" of root)</arg>
-    <arg name="content" type="string" required="false">File content (required for "write" operation)</arg>
-  </args>
-</tool>"""
+    def tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["read", "write", "list", "delete", "exists"],
+                        "description": "The file operation to perform",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path (not required for 'list' of root)",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File content (required for 'write' operation)",
+                    },
+                },
+                "required": ["operation"],
+            },
+        }

@@ -38,11 +38,22 @@ class BaseTool(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def schema_xml(self) -> str:
-        """Return XML description of this tool for the system prompt.
+    def tool_definition(self) -> dict[str, Any]:
+        """Return the tool definition in Anthropic API format.
 
-        The XML should describe the tool's purpose and all accepted arguments
-        in a format the LLM can understand and use to construct <tool_call> blocks.
+        Example:
+        {
+            "name": "code_exec",
+            "description": "Execute code in a sandboxed environment...",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "language": {"type": "string", "enum": ["python", "javascript", "bash"]},
+                    "code": {"type": "string", "description": "The code to execute"},
+                },
+                "required": ["language", "code"]
+            }
+        }
         """
         raise NotImplementedError
 
@@ -105,9 +116,6 @@ class ToolRegistry:
         """Return all registered tool names."""
         return list(self._tools.keys())
 
-    def build_schema_xml(self) -> str:
-        """Build the combined XML schema for all registered tools."""
-        parts: list[str] = []
-        for spec in self._tools.values():
-            parts.append(spec.tool.schema_xml())
-        return "\n\n".join(parts)
+    def build_tool_definitions(self) -> list[dict[str, Any]]:
+        """Build the list of tool definitions for the LLM API."""
+        return [spec.tool.tool_definition() for spec in self._tools.values()]

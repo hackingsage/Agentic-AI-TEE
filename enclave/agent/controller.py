@@ -17,10 +17,10 @@ from enclave.agent.models import (
     Message,
     StepEvent,
     StepResult,
-    TaskComplete,
     TaskRequest,
     TaskResult,
     ToolCall,
+    ToolResultBlock,
 )
 from enclave.agent.planner import Planner
 from enclave.tools.base import ToolRegistry
@@ -224,16 +224,24 @@ class AgentController:
                 data={"status": "calling LLM"},
             ))
 
+            async def on_chunk(token: str) -> None:
+                await self._emit_event(StepEvent(
+                    task_id=task.task_id,
+                    step_number=step_num,
+                    event_type="chunk",
+                    data={"chunk": token},
+                ))
+
             llm_response = await self._planner.plan_next_step(
                 system_prompt=system_prompt,
                 messages=messages,
                 task_id=task.task_id,
                 step_number=step_num,
+                on_chunk=on_chunk,
             )
 
-            # --- Step 2: Check for task_complete ---
-            task_complete = Planner.parse_task_complete(llm_response.text)
-            if task_complete:
+            # --- Step 2: Check if task is complete (no tool_use blocks = done) ---
+            if not llm_response.has_tool_use:
                 step = StepResult(
                     step_number=step_num,
                     llm_response=llm_response.text,
@@ -265,87 +273,74 @@ class AgentController:
                     task_id=task.task_id,
                     step_number=step_num,
                     event_type="complete",
-                    data={"summary": task_complete.summary},
+                    data={"summary": llm_response.text},
                 ))
 
                 return TaskResult(
                     task_id=task.task_id,
                     success=True,
-                    summary=task_complete.summary,
+                    summary=llm_response.text,
                     steps=steps,
                     total_cost_usd=total_cost,
                     attestation_hash=attestation_hash,
                 )
 
-            # --- Step 3: Parse tool calls ---
-            tool_calls = Planner.parse_tool_calls(llm_response.text)
+            # --- Step 3: Execute tool calls ---
+            # Append assistant message with all blocks (text + tool uses)
+            messages.append(Message(role="assistant", content=llm_response.content))
 
-            if not tool_calls:
-                # No tool call and no task_complete — add response and continue
-                messages.append(Message(role="assistant", content=llm_response.text))
-                messages.append(Message(
-                    role="user",
-                    content=(
-                        "You did not make a tool call or complete the task. "
-                        "Please either use a tool or output <task_complete> with a summary."
-                    ),
-                ))
-                step = StepResult(
-                    step_number=step_num,
-                    llm_response=llm_response.text,
-                    input_tokens=llm_response.input_tokens,
-                    output_tokens=llm_response.output_tokens,
-                    latency_ms=llm_response.latency_ms,
-                )
-                steps.append(step)
-                continue
-
-            # --- Step 4: Execute tool calls ---
-            for tool_call in tool_calls:
+            tool_results: list[ToolResultBlock] = []
+            for i, tool_block in enumerate(llm_response.tool_use_blocks):
                 await self._emit_event(StepEvent(
                     task_id=task.task_id,
                     step_number=step_num,
                     event_type="tool_call",
-                    data={"tool": tool_call.name, "args_keys": list(tool_call.args.keys())},
+                    data={"tool": tool_block.name, "args_keys": list(tool_block.input.keys())},
                 ))
 
+                tool_call = ToolCall(name=tool_block.name, args=tool_block.input)
                 tool_output = await self._router.dispatch(
                     tool_call,
                     task_id=task.task_id,
                     step_number=step_num,
                 )
 
-                # Build step result
+                # Collect result block
+                tool_results.append(ToolResultBlock(
+                    tool_use_id=tool_block.id,
+                    content=str(tool_output.result) if tool_output.success 
+                            else f"Error: {tool_output.error}",
+                    is_error=not tool_output.success,
+                ))
+
+                # Build step result.
+                # Only attribute LLM tokens/latency to the first tool result block to avoid duplicate costs.
                 step = StepResult(
                     step_number=step_num,
-                    tool_name=tool_call.name,
-                    tool_args=tool_call.args,
+                    tool_name=tool_block.name,
+                    tool_args=tool_block.input,
                     output=tool_output,
-                    llm_response=llm_response.text,
-                    input_tokens=llm_response.input_tokens,
-                    output_tokens=llm_response.output_tokens,
-                    latency_ms=llm_response.latency_ms,
+                    llm_response=llm_response.text if i == 0 else "",
+                    input_tokens=llm_response.input_tokens if i == 0 else 0,
+                    output_tokens=llm_response.output_tokens if i == 0 else 0,
+                    latency_ms=llm_response.latency_ms if i == 0 else 0.0,
                 )
                 steps.append(step)
-                task_hash_parts.append(f"{tool_call.name}:{tool_output.result}")
+                task_hash_parts.append(f"{tool_block.name}:{tool_output.result}")
 
                 await self._emit_event(StepEvent(
                     task_id=task.task_id,
                     step_number=step_num,
                     event_type="tool_result",
                     data={
-                        "tool": tool_call.name,
+                        "tool": tool_block.name,
                         "success": tool_output.success,
                         "latency_ms": round(tool_output.latency_ms, 2),
                     },
                 ))
 
-                # Feed result back to conversation
-                messages.append(Message(role="assistant", content=llm_response.text))
-                tool_result_xml = Planner.format_tool_outputs_xml(
-                    tool_call.name, tool_output
-                )
-                messages.append(Message(role="user", content=tool_result_xml))
+            # Feed all tool results back as a single user message containing tool result blocks
+            messages.append(Message(role="user", content=tool_results))
 
         # --- Guard: max steps ---
         total_cost = sum(s.cost_usd for s in steps)

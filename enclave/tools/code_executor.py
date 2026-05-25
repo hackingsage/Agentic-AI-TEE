@@ -174,12 +174,27 @@ class CodeExecutor(BaseTool):
                 except Exception:
                     pass
 
-    def schema_xml(self) -> str:
-        return """<tool name="code_exec">
-  <description>Execute code in a sandboxed environment. Supports Python, JavaScript, and Bash. Returns stdout/stderr and exit code.</description>
-  <args>
-    <arg name="language" type="string" required="true">Programming language: "python", "javascript", or "bash"</arg>
-    <arg name="code" type="string" required="true">The code to execute</arg>
-    <arg name="timeout" type="integer" required="false">Max execution time in seconds (default: 30, max: 120)</arg>
-  </args>
-</tool>"""
+    def tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "bash"],
+                        "description": "Programming language to execute",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "The code to execute",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max execution time in seconds (default: 30, max: 120)",
+                    },
+                },
+                "required": ["language", "code"],
+            },
+        }

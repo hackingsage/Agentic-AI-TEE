@@ -1,6 +1,8 @@
 """Core data structures for the Enclave agent.
 
 All inter-component data is passed as dataclasses — no raw dicts.
+Uses structured content blocks matching the Anthropic Messages API format
+for native tool_use support (Claude Code-style agentic loop).
 """
 
 from __future__ import annotations
@@ -8,12 +10,86 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Union
+
+
+# ─── Content Blocks ─────────────────────────────────────────────────────────── #
+
+
+@dataclass
+class TextBlock:
+    """A text content block in a message."""
+
+    text: str = ""
+    type: str = "text"
+
+
+@dataclass
+class ToolUseBlock:
+    """A tool_use content block from the model's response.
+
+    Represents a structured tool invocation with a unique ID,
+    tool name, and JSON arguments — no XML parsing needed.
+    """
+
+    id: str = ""
+    name: str = ""
+    input: dict[str, Any] = field(default_factory=dict)
+    type: str = "tool_use"
+
+
+@dataclass
+class ToolResultBlock:
+    """A tool_result content block to feed back to the model.
+
+    Matches the tool_use_id from the corresponding ToolUseBlock
+    so the model knows which tool call this result belongs to.
+    """
+
+    tool_use_id: str = ""
+    content: str = ""
+    is_error: bool = False
+    type: str = "tool_result"
+
+
+# Union type for all content block variants
+ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock]
+
+
+# ─── Messages ───────────────────────────────────────────────────────────────── #
+
+
+@dataclass
+class Message:
+    """A single message in the conversation history.
+
+    For simple user messages, content is a plain string.
+    For assistant responses with tool calls, or user messages with tool results,
+    content is a list of ContentBlock objects.
+    """
+
+    role: str  # "user" or "assistant"
+    content: str | list[ContentBlock] = ""
+
+    @property
+    def text(self) -> str:
+        """Extract text content from the message."""
+        if isinstance(self.content, str):
+            return self.content
+        return "\n".join(
+            b.text for b in self.content if isinstance(b, TextBlock) and b.text
+        )
+
+
+# ─── Tool Dispatch ──────────────────────────────────────────────────────────── #
 
 
 @dataclass
 class ToolCall:
-    """A parsed tool invocation from the LLM response."""
+    """A parsed tool invocation for internal dispatch by the ToolRouter.
+
+    Constructed from ToolUseBlock content blocks.
+    """
 
     name: str
     args: dict[str, Any] = field(default_factory=dict)
@@ -29,34 +105,47 @@ class ToolOutput:
     latency_ms: float = 0.0
 
 
-@dataclass
-class Message:
-    """A single message in the conversation history."""
-
-    role: str  # "user", "assistant", or "tool_result"
-    content: str
+# ─── LLM Response ──────────────────────────────────────────────────────────── #
 
 
 @dataclass
 class LLMResponse:
-    """Response from the LLM provider."""
+    """Response from the LLM provider with structured content blocks.
 
-    text: str
+    Instead of a flat text string, the response contains a list of
+    ContentBlock objects (TextBlock and/or ToolUseBlock), matching
+    the native API response format.
+    """
+
+    content: list[ContentBlock] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
     latency_ms: float = 0.0
+    stop_reason: str = ""  # "end_turn", "tool_use", "max_tokens"
+
+    @property
+    def text(self) -> str:
+        """Extract concatenated text from all TextBlocks."""
+        parts = [b.text for b in self.content if isinstance(b, TextBlock) and b.text]
+        return "\n".join(parts)
+
+    @property
+    def tool_use_blocks(self) -> list[ToolUseBlock]:
+        """Extract all tool_use blocks from the response."""
+        return [b for b in self.content if isinstance(b, ToolUseBlock)]
+
+    @property
+    def has_tool_use(self) -> bool:
+        """Check if the response contains any tool_use blocks."""
+        return any(isinstance(b, ToolUseBlock) for b in self.content)
 
     @property
     def cost_usd(self) -> float:
-        """Estimate cost using Claude Opus pricing ($15/1M input, $75/1M output)."""
-        return (self.input_tokens * 15 + self.output_tokens * 75) / 1_000_000
+        """Estimate cost using Claude Sonnet pricing ($3/1M input, $15/1M output)."""
+        return (self.input_tokens * 3 + self.output_tokens * 15) / 1_000_000
 
 
-@dataclass
-class TaskComplete:
-    """Parsed <task_complete> block from the LLM."""
-
-    summary: str
+# ─── Step & Task Results ────────────────────────────────────────────────────── #
 
 
 @dataclass
@@ -74,7 +163,7 @@ class StepResult:
 
     @property
     def cost_usd(self) -> float:
-        return (self.input_tokens * 15 + self.output_tokens * 75) / 1_000_000
+        return (self.input_tokens * 3 + self.output_tokens * 15) / 1_000_000
 
 
 @dataclass

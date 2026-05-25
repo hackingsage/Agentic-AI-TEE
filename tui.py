@@ -443,15 +443,14 @@ class EnclaveTUI:
         )
         self.console.print(f"  [dim]Prompt:[/dim] {description}\n")
 
-        # ── Execute with live status ──
+        # ── Execute with live streaming ──
         start = time.time()
         result_payload: dict[str, Any] = {}
+        current_step = 0
+        in_response_block = False
 
-        with self.console.status(
-            "  [bold cyan]⚡ Executing inside secure enclave...[/bold cyan]",
-            spinner="dots",
-        ):
-            response = await self.client.send(
+        try:
+            stream = self.client.send_stream(
                 MessageFrame(
                     msg_type="task_request",
                     payload={
@@ -464,7 +463,66 @@ class EnclaveTUI:
                 ),
                 timeout=300.0,
             )
-            result_payload = response.payload
+
+            async for response in stream:
+                if response.msg_type == "step_event":
+                    event_type = response.payload.get("event_type")
+                    step_number = response.payload.get("step_number", 0)
+                    data = response.payload.get("data", {})
+
+                    if event_type == "thinking":
+                        if in_response_block:
+                            self.console.print()
+                            in_response_block = False
+                        current_step = step_number
+                        self.console.print(f"\n[bold cyan]Step {step_number}: Thinking...[/bold cyan]")
+
+                    elif event_type == "chunk":
+                        token = data.get("chunk", "")
+                        if not in_response_block:
+                            self.console.print("[green]Response: [/green]", end="")
+                            in_response_block = True
+                        sys.stdout.write(token)
+                        sys.stdout.flush()
+
+                    elif event_type == "tool_call":
+                        if in_response_block:
+                            self.console.print()
+                            in_response_block = False
+                        tool_name = data.get("tool", "")
+                        args_keys = ", ".join(data.get("args_keys", []))
+                        self.console.print(f"  [bold yellow]🛠️  Tool Call:[/bold yellow] [yellow]{tool_name}({args_keys})[/yellow]")
+
+                    elif event_type == "tool_result":
+                        if in_response_block:
+                            self.console.print()
+                            in_response_block = False
+                        tool_name = data.get("tool", "")
+                        success = data.get("success", False)
+                        latency = data.get("latency_ms", 0.0)
+                        status_str = "[green]Success[/green]" if success else "[red]Failure[/red]"
+                        self.console.print(f"  [bold green]↩️  Tool Result:[/bold green] {tool_name} -> {status_str} ({latency:.1f}ms)")
+
+                    elif event_type == "error":
+                        if in_response_block:
+                            self.console.print()
+                            in_response_block = False
+                        err = data.get("error", "Unknown error")
+                        self.console.print(f"\n[bold red]❌ Error: {err}[/bold red]")
+
+                elif response.msg_type in ("task_result", "task_error", "error"):
+                    result_payload = response.payload
+                    break
+        except Exception as e:
+            logger.error(f"Error during streaming execution: {e}")
+            result_payload = {
+                "success": False,
+                "error": str(e),
+                "summary": "TUI streaming connection error",
+            }
+
+        if in_response_block:
+            self.console.print()
 
         elapsed = time.time() - start
         success = result_payload.get("success", False)

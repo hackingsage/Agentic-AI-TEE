@@ -108,9 +108,16 @@ class TestAgentLoop:
     @pytest.mark.asyncio
     async def test_max_steps_guard(self) -> None:
         """Agent is stopped when max steps reached."""
-        # Responses that never complete (no tool call, no task_complete)
+        # Responses that never complete (each makes a tool call to memory_tool to keep loop active)
         responses = [
-            "I'm thinking about what to do next..."
+            """<thinking>Thinking...</thinking>
+<tool_call>
+  <name>memory_tool</name>
+  <args>
+    <action>read</action>
+    <key>dummy</key>
+  </args>
+</tool_call>"""
             for _ in range(10)
         ]
         controller, _ = _build_controller(responses, max_steps=3)
@@ -132,11 +139,17 @@ class TestAgentLoop:
         original_call = mock_llm.call
 
         async def expensive_call(*args, **kwargs):
-            from enclave.agent.models import LLMResponse
+            from enclave.agent.models import LLMResponse, ToolUseBlock
             mock_llm._call_count += 1
             mock_llm._calls.append({"args": args, "kwargs": kwargs})
             return LLMResponse(
-                text="Still thinking...",
+                content=[
+                    ToolUseBlock(
+                        id="call_1",
+                        name="code_exec",
+                        input={"language": "python", "code": "print(1)"},
+                    )
+                ],
                 input_tokens=100000,  # Very expensive
                 output_tokens=50000,
                 latency_ms=100.0,

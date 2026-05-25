@@ -172,14 +172,35 @@ class MemoryTool(BaseTool):
 
         return ToolOutput(success=False, error=f"Unknown operation: {operation}")
 
-    def schema_xml(self) -> str:
-        return """<tool name="memory_search">
-  <description>Search and store information in the agent's long-term memory.</description>
-  <args>
-    <arg name="operation" type="string" required="true">One of: "search", "store", "list_recent"</arg>
-    <arg name="query" type="string" required="false">Search query (required for "search")</arg>
-    <arg name="content" type="string" required="false">Content to store (required for "store")</arg>
-    <arg name="metadata" type="object" required="false">Optional metadata for stored entries</arg>
-    <arg name="n_results" type="integer" required="false">Number of results to return (default: 5)</arg>
-  </args>
-</tool>"""
+    def tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["search", "store", "list_recent"],
+                        "description": "Memory operation: 'search', 'store', or 'list_recent'",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (required for 'search')",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to store (required for 'store')",
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional metadata for stored entries",
+                    },
+                    "n_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (default: 5)",
+                    },
+                },
+                "required": ["operation"],
+            },
+        }
