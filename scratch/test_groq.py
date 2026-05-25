@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 # Add project root to sys.path so we can import enclave modules
-project_root = Path(r"c:\Users\AYUSH\Downloads\Agentic-AI-TEE")
+project_root = Path(r"\Agentic-AI-TEE")
 sys.path.insert(0, str(project_root))
 
 from enclave.agent.llm_client import GroqClient
@@ -15,7 +15,7 @@ from enclave.tools.grep_search import GrepSearchTool
 from enclave.tools.bash_tool import BashTool
 
 async def test_groq():
-    api_key = "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"
+    api_key = "Your_key"
     client = GroqClient(model="llama-3.3-70b-versatile", api_key=api_key)
     
     # We will register our tools to build tool definitions
