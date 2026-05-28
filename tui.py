@@ -60,6 +60,10 @@ WARN = "yellow"
 # Persistent config file for API keys and preferred model
 CONFIG_DIR = Path.home() / ".enclave"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+SESSION_FILE = CONFIG_DIR / "session.json"
+
+# Project-level config file (like CLAUDE.md)
+ENCLAVE_MD = "ENCLAVE.md"
 
 BANNER = r"""
 [bold cyan]
@@ -120,6 +124,91 @@ class EnclaveTUI:
         self._compact_mode: bool = False
         self._enable_thinking: bool = False
         self._require_permission: bool = False
+        self._permission_future: asyncio.Future | None = None
+
+    # ── Session Persistence ──────────────────────────────────────────────── #
+
+    def _save_session(self) -> None:
+        """Save current conversation history to disk for resume."""
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            data = {
+                "project_root": str(self._project_root),
+                "session_cost": self._session_cost,
+                "messages": [
+                    {"role": m.role, "content": m.content if isinstance(m.content, str) else "[complex]"}
+                    for m in self._conversation_history
+                    if isinstance(m.content, str)  # Only persist text messages
+                ],
+            }
+            SESSION_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"Failed to save session: {exc}")
+
+    def _load_session(self) -> bool:
+        """Load saved conversation history. Returns True if session was restored."""
+        if not SESSION_FILE.exists():
+            return False
+        try:
+            data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+            saved_root = data.get("project_root", "")
+            if saved_root != str(self._project_root):
+                return False  # Different project, don't restore
+
+            messages = data.get("messages", [])
+            if not messages:
+                return False
+
+            self._conversation_history = [
+                Message(role=m["role"], content=m["content"])
+                for m in messages
+            ]
+            self._session_cost = data.get("session_cost", 0.0)
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to load session: {exc}")
+            return False
+
+    def _clear_session(self) -> None:
+        """Clear saved session from disk."""
+        try:
+            if SESSION_FILE.exists():
+                SESSION_FILE.unlink()
+        except Exception:
+            pass
+
+    # ── Project Config (ENCLAVE.md) ──────────────────────────────────────── #
+
+    def _load_project_config(self) -> str:
+        """Load ENCLAVE.md project-specific instructions if it exists."""
+        config_path = self._project_root / ENCLAVE_MD
+        if not config_path.exists():
+            return ""
+        try:
+            content = config_path.read_text(encoding="utf-8").strip()
+            if content:
+                return f"\n\n## Project-Specific Instructions (from ENCLAVE.md)\n\n{content}\n"
+            return ""
+        except Exception:
+            return ""
+
+    # ── Permission Callback ──────────────────────────────────────────────── #
+
+    async def _permission_callback(self, tool_name: str, args: dict[str, Any]) -> bool:
+        """Interactive permission prompt. Pauses agent until user responds."""
+        loop = asyncio.get_event_loop()
+        self._permission_future = loop.create_future()
+
+        # The TUI event loop will handle the prompt and resolve the future
+        # (see _handle_permission_event in the event loop)
+        try:
+            result = await asyncio.wait_for(self._permission_future, timeout=120.0)
+            return result
+        except asyncio.TimeoutError:
+            self.console.print("  [yellow]Permission timed out — allowing.[/yellow]")
+            return True
+        finally:
+            self._permission_future = None
 
     # ── Persistence ──────────────────────────────────────────────────────── #
 
@@ -228,6 +317,15 @@ class EnclaveTUI:
                 self._project_root, self._project_tree
             )
 
+            # Append ENCLAVE.md project config if it exists
+            project_config = self._load_project_config()
+            if project_config:
+                self._system_prompt += project_config
+                status.update("[bold cyan]  Loaded ENCLAVE.md project config...[/bold cyan]")
+
+            # Wire permission callback
+            self.service.controller.set_permission_callback(self._permission_callback)
+
             # ── Find free port ──
             status.update("[bold cyan]  Binding vsock transport...[/bold cyan]")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -278,6 +376,18 @@ class EnclaveTUI:
         # ── Auto-attest ──
         await self._show_attestation()
 
+        # ── Try to restore previous session ──
+        enclave_md_exists = (self._project_root / ENCLAVE_MD).exists()
+        restored = self._load_session()
+        if restored:
+            self.console.print(
+                f"  [green]✓ Restored previous session ({len(self._conversation_history)} messages, "
+                f"${self._session_cost:.6f} cost)[/green]"
+            )
+            self.console.print("  [dim]Use /clear to start fresh.[/dim]")
+        if enclave_md_exists:
+            self.console.print(f"  [green]✓ Loaded project config from ENCLAVE.md[/green]")
+
         self.console.print(
             "\n  [dim]Type [bold white]/help[/bold white] for commands, "
             "or just type a prompt to start coding.[/dim]\n"
@@ -298,10 +408,13 @@ class EnclaveTUI:
             except Exception:
                 pass  # swallow errors during teardown
 
+        # Save session before shutdown
+        self._save_session()
+
         self.console.print(
             Panel(
                 "[bold green]Enclave shut down cleanly.[/bold green]\n"
-                "[dim]All in-memory data has been wiped. No trace remains.[/dim]",
+                f"[dim]Session saved. Cost: ${self._session_cost:.6f}. No trace remains in memory.[/dim]",
                 border_style="green",
                 padding=(1, 2),
             )
@@ -343,7 +456,12 @@ class EnclaveTUI:
                         self._show_coding_help()
                     elif command == "clear":
                         self._conversation_history.clear()
-                        self.console.print("  [green]Conversation history cleared.[/green]")
+                        self._session_cost = 0.0
+                        self._clear_session()
+                        self.console.print("  [green]Conversation history and saved session cleared.[/green]")
+                    elif command == "save":
+                        self._save_session()
+                        self.console.print(f"  [green]Session saved ({len(self._conversation_history)} messages).[/green]")
                     elif command == "status":
                         await self._show_coding_status()
                     elif command == "cost":
@@ -406,9 +524,10 @@ class EnclaveTUI:
         """Generate a compact directory tree string, ignoring common build/temp dirs."""
         ignored = {".git", "__pycache__", ".venv", "node_modules", ".enclave", ".gemini", "enclave.egg-info"}
         lines = []
+        MAX_TREE_LINES = 80
 
         def walk(dir_path: Path, prefix: str = "", depth: int = 0):
-            if depth > 2:  # Limit depth to keep it compact
+            if depth > 2 or len(lines) >= MAX_TREE_LINES:
                 return
             try:
                 entries = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -416,7 +535,7 @@ class EnclaveTUI:
                 return
 
             for i, entry in enumerate(entries):
-                if entry.name in ignored:
+                if entry.name in ignored or len(lines) >= MAX_TREE_LINES:
                     continue
                 is_last = (i == len(entries) - 1)
                 connector = "└── " if is_last else "├── "
@@ -429,7 +548,10 @@ class EnclaveTUI:
                     lines.append(f"{prefix}{connector}{entry.name}")
 
         walk(self._project_root)
-        return "\n".join(lines) if lines else "(empty directory)"
+        tree = "\n".join(lines) if lines else "(empty directory)"
+        if len(lines) >= MAX_TREE_LINES:
+            tree += "\n... (tree truncated)"
+        return tree
 
     async def _run_conversation_turn(self, user_message: str) -> None:
         """Execute a conversation turn and stream the results to the console."""
@@ -526,16 +648,51 @@ class EnclaveTUI:
                     tool_name = data.get("tool", "")
                     success = data.get("success", False)
                     latency = data.get("latency_ms", 0.0)
+                    result_preview = data.get("result_preview", "")
                     status_str = "[green]✓[/green]" if success else "[red]✗[/red]"
                     if not self._compact_mode:
                         self.console.print(f"  {status_str} [dim]({latency:.1f}ms)[/dim]")
                     else:
                         self.console.print(f"{status_str} ", end="", flush=True)
 
+                elif event_type == "permission_request":
+                    # Interactive permission prompt
+                    tool_name = data.get("tool", "")
+                    args_preview = data.get("args", {})
+                    detail = _format_tool_detail(tool_name, args_preview)
+                    self.console.print(
+                        f"\n  [bold yellow]⚠ Permission required:[/bold yellow] "
+                        f"[bold white]{tool_name}[/bold white] [dim]{detail}[/dim]"
+                    )
+                    try:
+                        answer = Prompt.ask(
+                            "  [bold yellow]Allow?[/bold yellow]",
+                            choices=["y", "n", "a"],
+                            default="y",
+                        )
+                        if answer == "a":
+                            # Allow all — disable permission mode
+                            self._require_permission = False
+                            self.service.controller.require_permission = False
+                            self.console.print("  [green]Permissions disabled for this session.[/green]")
+                            allowed = True
+                        else:
+                            allowed = answer == "y"
+
+                        if self._permission_future and not self._permission_future.done():
+                            self._permission_future.set_result(allowed)
+                    except Exception:
+                        if self._permission_future and not self._permission_future.done():
+                            self._permission_future.set_result(True)
+
                 elif event_type == "checkpoint":
                     tool_calls = data.get("tool_calls", 0)
                     cost = data.get("cost_usd", 0.0)
-                    self.console.print(f"\n  [dim cyan]── checkpoint: {tool_calls} tool calls · ${cost:.6f} ──[/dim cyan]")
+                    message = data.get("message", "")
+                    if message:
+                        self.console.print(f"\n  [dim cyan]── {message} ──[/dim cyan]")
+                    elif tool_calls:
+                        self.console.print(f"\n  [dim cyan]── checkpoint: {tool_calls} tool calls · ${cost:.6f} ──[/dim cyan]")
 
                 elif event_type == "error":
                     if in_response_block:

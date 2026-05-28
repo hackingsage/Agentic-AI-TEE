@@ -200,6 +200,15 @@ MODEL_CATALOG: dict[str, list[ModelInfo]] = {
     ],
     "groq": [
         ModelInfo(
+            id="meta-llama/llama-4-scout-17b-16e-instruct",
+            name="Llama 4 Scout 17B",
+            provider="groq",
+            input_price_per_m=0.11,
+            output_price_per_m=0.34,
+            context_window=128_000,
+            description="Multimodal, tool use, fast — best for coding",
+        ),
+        ModelInfo(
             id="llama-3.3-70b-versatile",
             name="Llama 3.3 70B",
             provider="groq",
@@ -209,6 +218,33 @@ MODEL_CATALOG: dict[str, list[ModelInfo]] = {
             description="Versatile high-speed 70B model",
         ),
         ModelInfo(
+            id="openai/gpt-oss-120b",
+            name="GPT-OSS 120B",
+            provider="groq",
+            input_price_per_m=1.50,
+            output_price_per_m=3.00,
+            context_window=131_072,
+            description="OpenAI flagship open-weight 120B, browser search & code exec",
+        ),
+        ModelInfo(
+            id="openai/gpt-oss-20b",
+            name="GPT-OSS 20B",
+            provider="groq",
+            input_price_per_m=0.30,
+            output_price_per_m=0.60,
+            context_window=131_072,
+            description="OpenAI lightweight open-weight 20B, fast and capable",
+        ),
+        ModelInfo(
+            id="qwen/qwen3-32b",
+            name="Qwen3 32B",
+            provider="groq",
+            input_price_per_m=0.29,
+            output_price_per_m=0.39,
+            context_window=131_072,
+            description="Dual-mode reasoning, strong for agentic tasks (preview)",
+        ),
+        ModelInfo(
             id="llama-3.1-8b-instant",
             name="Llama 3.1 8B",
             provider="groq",
@@ -216,15 +252,6 @@ MODEL_CATALOG: dict[str, list[ModelInfo]] = {
             output_price_per_m=0.08,
             context_window=128_000,
             description="Fast and cost-effective 8B model",
-        ),
-        ModelInfo(
-            id="deepseek-r1-distill-llama-70b",
-            name="DeepSeek R1 Distill 70B",
-            provider="groq",
-            input_price_per_m=0.59,
-            output_price_per_m=0.79,
-            context_window=128_000,
-            description="DeepSeek R1 reasoning model distilled to Llama 70B",
         ),
     ],
     "mock": [
@@ -866,6 +893,54 @@ class OpenRouterClient(LLMClient):
 # ─── Groq ───────────────────────────────────────────────────────────────────── #
 
 
+def _parse_groq_failed_generation(failed_gen: str) -> dict[str, Any] | None:
+    """Parse Groq's failed_generation field to recover the intended tool call.
+
+    Groq's Llama models sometimes generate tool calls in malformed formats like:
+      <function=bash{"command": "uname -a"}</function>
+      <function=bash [{"command": "uname -a"}](1)</function>
+
+    This function attempts to extract the tool name and arguments from these
+    malformed generations so we can still execute the intended tool call.
+
+    Returns:
+        dict with 'name' and 'args' keys, or None if parsing fails.
+    """
+    if not failed_gen or not failed_gen.strip():
+        return None
+
+    try:
+        # Pattern 1: <function=name{json_args}</function>
+        match = re.search(r'<function=(\w+)\s*(\{.*?\})\s*</function>', failed_gen, re.DOTALL)
+        if match:
+            name = match.group(1)
+            args_str = match.group(2)
+            args = json.loads(args_str)
+            return {"name": name, "args": args}
+
+        # Pattern 2: <function=name [json_args](number)</function>
+        match = re.search(r'<function=(\w+)\s*\[(.*?)\]\s*\(\d+\)\s*</function>', failed_gen, re.DOTALL)
+        if match:
+            name = match.group(1)
+            args_str = match.group(2)
+            args = json.loads(args_str)
+            return {"name": name, "args": args}
+
+        # Pattern 3: <function=name>json_args</function>
+        match = re.search(r'<function=(\w+)>\s*(\{.*?\})\s*</function>', failed_gen, re.DOTALL)
+        if match:
+            name = match.group(1)
+            args_str = match.group(2)
+            args = json.loads(args_str)
+            return {"name": name, "args": args}
+
+        logger.debug(f"Could not parse Groq failed_generation: {failed_gen[:200]}")
+        return None
+    except (json.JSONDecodeError, AttributeError, IndexError) as exc:
+        logger.debug(f"JSON parse error in failed_generation recovery: {exc}")
+        return None
+
+
 class GroqClient(LLMClient):
     """Groq API client."""
 
@@ -873,7 +948,7 @@ class GroqClient(LLMClient):
 
     def __init__(
         self,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
         api_key: str | None = None,
         base_url: str | None = None,
     ) -> None:
@@ -916,7 +991,7 @@ class GroqClient(LLMClient):
             payload["tools"] = _convert_tools_to_openai(tools)
             payload["parallel_tool_calls"] = False
 
-        max_retries = 6
+        max_retries = 3
         backoff = 2.0
         data = {}
 
@@ -932,6 +1007,8 @@ class GroqClient(LLMClient):
                     if resp.status_code == 429:
                         retry_after = resp.headers.get("Retry-After")
                         wait_time = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else backoff
+                        # Cap wait time to 30 seconds — don't honor absurd Retry-After values
+                        wait_time = min(wait_time, 30.0)
                         logger.warning(
                             f"Rate limit (429) from Groq. Retrying in {wait_time:.1f}s... "
                             f"(Attempt {attempt + 1}/{max_retries})"
@@ -939,7 +1016,7 @@ class GroqClient(LLMClient):
                         if attempt == max_retries:
                             resp.raise_for_status()
                         await asyncio.sleep(wait_time)
-                        backoff *= 2
+                        backoff = min(backoff * 2, 30.0)
                         continue
 
                     if resp.status_code >= 500:
@@ -950,16 +1027,70 @@ class GroqClient(LLMClient):
                         if attempt == max_retries:
                             resp.raise_for_status()
                         await asyncio.sleep(backoff)
-                        backoff *= 2
+                        backoff = min(backoff * 2, 30.0)
                         continue
 
-                    if resp.status_code >= 400:
-                        logger.error(f"Groq API error ({resp.status_code}): {resp.text}")
+                    if resp.status_code == 400:
+                        # Check for tool_use_failed — parse the failed_generation
+                        error_data = resp.json() if resp.text else {}
+                        error_info = error_data.get("error", {})
+                        if error_info.get("code") == "tool_use_failed":
+                            failed_gen = error_info.get("failed_generation", "")
+                            parsed = _parse_groq_failed_generation(failed_gen)
+                            if parsed:
+                                elapsed_ms = (time.monotonic() - start) * 1000
+                                logger.info(
+                                    f"Recovered tool call from Groq failed_generation: "
+                                    f"{parsed['name']}({list(parsed['args'].keys())})"
+                                )
+                                content_blocks: list[ContentBlock] = [
+                                    ToolUseBlock(
+                                        id=f"call_{uuid.uuid4().hex[:16]}",
+                                        name=parsed["name"],
+                                        input=parsed["args"],
+                                    )
+                                ]
+                                result = LLMResponse(
+                                    content=content_blocks,
+                                    input_tokens=0,
+                                    output_tokens=0,
+                                    latency_ms=elapsed_ms,
+                                    stop_reason="tool_use",
+                                )
+                                logger.info(
+                                    "llm_call",
+                                    extra={
+                                        "task_id": task_id,
+                                        "step": step_number,
+                                        "model": self._model,
+                                        "provider": "groq",
+                                        "recovered": True,
+                                        "input_tokens": 0,
+                                        "output_tokens": 0,
+                                        "latency_ms": round(elapsed_ms, 2),
+                                    },
+                                )
+                                return result
+                            else:
+                                logger.warning(
+                                    f"Groq tool_use_failed but could not parse: {failed_gen[:200]}"
+                                )
+                        # Non-recoverable 400 — raise immediately, don't retry
+                        logger.error(f"Groq API error ({resp.status_code}): {resp.text[:500]}")
                         raise httpx.HTTPStatusError(
-                            f"Groq API error ({resp.status_code}): {resp.text}",
+                            f"Groq API error ({resp.status_code})",
                             request=resp.request,
-                            response=resp
+                            response=resp,
                         )
+
+                    if resp.status_code >= 400:
+                        logger.error(f"Groq API error ({resp.status_code}): {resp.text[:500]}")
+                        raise httpx.HTTPStatusError(
+                            f"Groq API error ({resp.status_code}): {resp.text[:500]}",
+                            request=resp.request,
+                            response=resp,
+                        )
+
                     data = resp.json()
                     break
             except httpx.HTTPError as exc:
@@ -972,7 +1103,7 @@ class GroqClient(LLMClient):
                     f"(Attempt {attempt + 1}/{max_retries})"
                 )
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 30.0)
 
         elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -1456,7 +1587,7 @@ def create_llm_client(
         )
     elif provider == "groq":
         return GroqClient(
-            model=model or "llama-3.3-70b-versatile",
+            model=model or "meta-llama/llama-4-scout-17b-16e-instruct",
             api_key=api_key or None,
             base_url=base_url or None,
         )

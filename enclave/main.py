@@ -144,6 +144,7 @@ class EnclaveService:
             llm,
             self.tool_registry,
             default_timeout=config.default_timeout,
+            provider=config.llm_provider,
         )
 
         # -- Vsock Server --

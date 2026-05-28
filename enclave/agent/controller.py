@@ -51,6 +51,140 @@ TRUNCATION_KEEP_TAIL = 10_000
 MAX_TOOL_RETRIES = 2
 TOOL_RETRY_DELAY = 0.5  # seconds
 
+# Context window management
+# Rough estimate: 1 token ≈ 4 characters for English text
+CHARS_PER_TOKEN = 4
+# Compact when usage exceeds this fraction of the context window
+COMPACT_THRESHOLD = 0.70
+# Default context window size (conservative, per-provider overrides below)
+DEFAULT_CONTEXT_WINDOW = 128_000
+# Provider-specific context windows
+PROVIDER_CONTEXT_WINDOWS = {
+    "anthropic": 200_000,
+    "openai": 128_000,
+    "gemini": 1_000_000,
+    "groq": 128_000,
+    "openrouter": 128_000,
+    "ollama": 8_000,
+    "mock": 128_000,
+}
+# Keep at least this many recent messages when compacting
+MIN_RECENT_MESSAGES = 6
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate. 1 token ≈ 4 chars for English."""
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def _estimate_message_tokens(msg: Message) -> int:
+    """Estimate token count for a single message."""
+    if isinstance(msg.content, str):
+        return _estimate_tokens(msg.content) + 4  # role overhead
+    # Content is a list of blocks
+    total = 4  # role overhead
+    for block in msg.content:
+        if hasattr(block, "text"):
+            total += _estimate_tokens(block.text)
+        elif hasattr(block, "thinking"):
+            total += _estimate_tokens(block.thinking)
+        elif hasattr(block, "content"):
+            total += _estimate_tokens(str(block.content))
+        elif hasattr(block, "input"):
+            total += _estimate_tokens(str(block.input)) + _estimate_tokens(block.name if hasattr(block, "name") else "")
+    return total
+
+
+def _estimate_history_tokens(system_prompt: str, messages: list[Message]) -> int:
+    """Estimate total token count for a system prompt + message history."""
+    total = _estimate_tokens(system_prompt)
+    for msg in messages:
+        total += _estimate_message_tokens(msg)
+    return total
+
+
+def _compact_history(messages: list[Message], target_tokens: int, system_tokens: int) -> list[Message]:
+    """Compact conversation history by summarizing older messages.
+
+    Keeps the first message (original user request context) and the most recent
+    messages, replacing the middle with a summary.
+
+    Args:
+        messages: Full conversation history.
+        target_tokens: Max tokens the history should fit in (excluding system prompt).
+        system_tokens: Tokens already used by the system prompt.
+
+    Returns:
+        Compacted message list.
+    """
+    if len(messages) <= MIN_RECENT_MESSAGES:
+        return messages
+
+    available_tokens = target_tokens - system_tokens
+
+    # Check if we actually need to compact
+    current_tokens = sum(_estimate_message_tokens(m) for m in messages)
+    if current_tokens <= available_tokens:
+        return messages
+
+    # Strategy: keep first message + last MIN_RECENT_MESSAGES, summarize middle
+    first_msg = messages[0]
+    recent_msgs = messages[-MIN_RECENT_MESSAGES:]
+    middle_msgs = messages[1:-MIN_RECENT_MESSAGES]
+
+    if not middle_msgs:
+        return messages
+
+    # Build a summary of the middle messages
+    summary_parts = []
+    for msg in middle_msgs:
+        role = msg.role
+        if isinstance(msg.content, str):
+            text = msg.content[:200]
+        else:
+            # Summarize blocks
+            block_summaries = []
+            for block in msg.content:
+                if hasattr(block, "text") and block.text:
+                    block_summaries.append(block.text[:100])
+                elif hasattr(block, "name"):
+                    args_preview = ""
+                    if hasattr(block, "input"):
+                        args_preview = str(block.input)[:80]
+                    block_summaries.append(f"[tool:{block.name}({args_preview})]")
+                elif hasattr(block, "content") and hasattr(block, "tool_use_id"):
+                    result_preview = str(block.content)[:80]
+                    status = "error" if getattr(block, "is_error", False) else "ok"
+                    block_summaries.append(f"[result:{status}:{result_preview}]")
+            text = " | ".join(block_summaries)[:200]
+
+        if text.strip():
+            summary_parts.append(f"[{role}]: {text}")
+
+    summary_text = (
+        "[CONTEXT COMPACTED — Earlier conversation summarized to save context window space]\n\n"
+        + "\n".join(summary_parts[:30])  # Cap at 30 summary lines
+    )
+    if len(summary_parts) > 30:
+        summary_text += f"\n... and {len(summary_parts) - 30} more exchanges"
+
+    summary_msg = Message(role="user", content=summary_text)
+
+    compacted = [first_msg, summary_msg] + recent_msgs
+
+    logger.info(
+        "context_compacted",
+        extra={
+            "original_messages": len(messages),
+            "compacted_messages": len(compacted),
+            "original_tokens": current_tokens,
+            "compacted_tokens": sum(_estimate_message_tokens(m) for m in compacted),
+            "summarized_exchanges": len(middle_msgs),
+        },
+    )
+
+    return compacted
+
 
 def _truncate_output(output: str) -> str:
     """Truncate tool output if it exceeds the limit, keeping head and tail."""
@@ -89,11 +223,20 @@ class AgentController:
         tool_registry: ToolRegistry,
         *,
         default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        provider: str = "mock",
+        context_window: int = 0,
     ) -> None:
         self._planner = Planner(llm_client, tool_registry)
         self._router = ToolRouter(tool_registry)
         self._tool_registry = tool_registry
         self._default_timeout = default_timeout
+
+        # Context window management
+        if context_window > 0:
+            self._context_window = context_window
+        else:
+            self._context_window = PROVIDER_CONTEXT_WINDOWS.get(provider, DEFAULT_CONTEXT_WINDOW)
+        self._provider = provider
 
         # Event subscribers for streaming
         self._event_queue: asyncio.Queue[StepEvent] | None = None
@@ -102,6 +245,9 @@ class AgentController:
         self._enable_thinking: bool = False
         self._require_permission: bool = False
         self._permission_callback: Any = None  # async callable (tool_name, args) -> bool
+
+    # Tools that require permission when permission mode is on
+    DANGEROUS_TOOLS = {"bash", "write_file", "edit_file", "multi_edit", "git"}
 
     @property
     def enable_thinking(self) -> bool:
@@ -118,6 +264,39 @@ class AgentController:
     @require_permission.setter
     def require_permission(self, value: bool) -> None:
         self._require_permission = value
+
+    def set_permission_callback(self, callback: Any) -> None:
+        """Set the permission callback: async (tool_name, args) -> bool."""
+        self._permission_callback = callback
+
+    async def _check_permission(self, tool_name: str, args: dict[str, Any], task_id: str, step_num: int) -> bool:
+        """Check if a tool call is allowed. Returns True if allowed."""
+        if not self._require_permission:
+            return True
+        if tool_name not in self.DANGEROUS_TOOLS:
+            return True
+        if self._permission_callback is None:
+            return True
+
+        # Emit a permission_request event so the TUI can show the prompt
+        await self._emit_event(StepEvent(
+            task_id=task_id,
+            step_number=step_num,
+            event_type="permission_request",
+            data={
+                "tool": tool_name,
+                "args": _safe_args_preview(tool_name, args),
+            },
+        ))
+
+        try:
+            allowed = await self._permission_callback(tool_name, args)
+            if not allowed:
+                logger.info(f"Permission denied for {tool_name}")
+            return allowed
+        except Exception as exc:
+            logger.warning(f"Permission callback error: {exc}")
+            return True  # fail-open on callback errors
 
     def enable_streaming(self) -> asyncio.Queue[StepEvent]:
         """Enable event streaming. Returns the queue to read events from."""
@@ -532,6 +711,36 @@ class AgentController:
                     ))
                     return f"Error: {err_msg}", current_cost
 
+                # --- Guard: context window ---
+                estimated_tokens = _estimate_history_tokens(system_prompt, conversation_history)
+                compact_limit = int(self._context_window * COMPACT_THRESHOLD)
+                if estimated_tokens > compact_limit and len(conversation_history) > MIN_RECENT_MESSAGES:
+                    logger.info(
+                        "context_compaction_triggered",
+                        extra={
+                            "estimated_tokens": estimated_tokens,
+                            "context_window": self._context_window,
+                            "threshold": compact_limit,
+                            "messages_before": len(conversation_history),
+                        },
+                    )
+                    system_tokens = _estimate_tokens(system_prompt)
+                    compacted = _compact_history(conversation_history, compact_limit, system_tokens)
+                    # Replace in-place so the caller's reference is updated
+                    conversation_history.clear()
+                    conversation_history.extend(compacted)
+
+                    await self._emit_event(StepEvent(
+                        task_id=task_id,
+                        step_number=step_num,
+                        event_type="checkpoint",
+                        data={
+                            "message": "Context compacted to fit within provider's context window",
+                            "estimated_tokens": _estimate_history_tokens(system_prompt, conversation_history),
+                            "context_window": self._context_window,
+                        },
+                    ))
+
                 # --- Step 1: Call LLM ---
                 await self._emit_event(StepEvent(
                     task_id=task_id,
@@ -610,8 +819,21 @@ class AgentController:
                         },
                     ))
 
-                # Execute all tool calls in parallel
+                # Execute all tool calls in parallel (with permission check)
                 async def _execute_one(tool_block: Any) -> tuple[Any, Any]:
+                    # Check permission for dangerous tools
+                    allowed = await self._check_permission(
+                        tool_block.name, tool_block.input, task_id, step_num
+                    )
+                    if not allowed:
+                        from enclave.tools.base import ToolOutput
+                        denied = ToolOutput(
+                            success=False,
+                            result="",
+                            error=f"Permission denied by user for {tool_block.name}",
+                        )
+                        return tool_block, denied
+
                     tool_call = ToolCall(name=tool_block.name, args=tool_block.input)
                     output = await self._dispatch_with_retry(
                         tool_call,
